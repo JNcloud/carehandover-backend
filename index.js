@@ -11,6 +11,31 @@ const supabase = createClient(
   { auth: { persistSession: false, autoRefreshToken: false } }
 );
 
+// Startup self-check, written to the private Render log. It never prints a key.
+function keyKind(key) {
+  if (!key) return 'MISSING';
+  if (key.startsWith('sb_secret_')) return 'secret key (new format): OK';
+  if (key.startsWith('sb_publishable_')) return 'PUBLISHABLE key: WRONG, the backend needs the secret key';
+  if (key.startsWith('eyJ')) {
+    try {
+      const role = JSON.parse(Buffer.from(key.split('.')[1], 'base64url').toString('utf8')).role;
+      return role === 'service_role' ? 'legacy service_role key: OK' : `legacy key with role "${role}": WRONG`;
+    } catch {
+      return 'unreadable legacy key';
+    }
+  }
+  return 'unknown format';
+}
+(async () => {
+  console.log(`[startup] Supabase key: ${keyKind(process.env.SUPABASE_SERVICE_ROLE_KEY)}`);
+  const { count, error } = await supabase.from('organizations').select('id', { count: 'exact', head: true });
+  console.log(
+    error
+      ? `[startup] database check FAILED: ${error.message}`
+      : `[startup] database check OK, organizations visible: ${count} (expected at least 1)`
+  );
+})().catch((e) => console.error('[startup] self-check crashed:', e.message));
+
 // Set REQUIRE_MFA=true on Render once the manager has enrolled an authenticator app.
 const REQUIRE_MFA = process.env.REQUIRE_MFA === 'true';
 
@@ -261,31 +286,43 @@ async function loadAdmin(req) {
   const token = bearerOf(req);
   if (!token || token.startsWith('dev_')) return null;
   const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
+  if (error || !data?.user) {
+    console.error('[auth] token check failed:', error?.message || 'no user returned');
+    return null;
+  }
   const user = data.user;
 
-  let { data: member } = await supabase
+  const first = await supabase
     .from('members')
     .select(MEMBER_COLS)
     .eq('auth_user_id', user.id)
     .maybeSingle();
+  if (first.error) console.error('[auth] member lookup error:', first.error.message);
+  let member = first.data;
 
   // First login: link the Auth account to the member with the same VERIFIED email.
   if (!member && user.email && user.email_confirmed_at) {
-    const { data: byEmail } = await supabase
+    const { data: byEmail, error: emailErr } = await supabase
       .from('members')
       .select('id')
       .eq('email', user.email.toLowerCase())
       .is('auth_user_id', null)
       .maybeSingle();
+    if (emailErr) console.error('[auth] lookup by email error:', emailErr.message);
+    if (!byEmail) console.error('[auth] no unlinked member found for the signed-in email');
     if (byEmail) {
-      await supabase.from('members').update({ auth_user_id: user.id }).eq('id', byEmail.id).is('auth_user_id', null);
+      const upd = await supabase.from('members').update({ auth_user_id: user.id }).eq('id', byEmail.id).is('auth_user_id', null);
+      if (upd.error) console.error('[auth] linking failed:', upd.error.message);
       const linked = await supabase.from('members').select(MEMBER_COLS).eq('id', byEmail.id).maybeSingle();
+      if (linked.error) console.error('[auth] reading linked member failed:', linked.error.message);
       member = linked.data;
       if (member) await audit(member.org_id, 'member', member.id, 'member.login_linked', { email: user.email });
     }
   }
-  if (!member || !member.active || member.archived_at) return null;
+  if (!member || !member.active || member.archived_at) {
+    console.error('[auth] sign-in refused: no active member for this account');
+    return null;
+  }
   return {
     id: member.id,
     orgId: member.org_id,
