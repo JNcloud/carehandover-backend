@@ -752,11 +752,14 @@ app.post(
   })
 );
 
+// Residents that changed on this device, plus rooms that were released. A release is a soft
+// removal (removed_at), so it reaches the other devices and nothing is ever deleted.
 app.post(
   '/sync/residents',
   requireDevice,
   wrap(async (req, res) => {
     const residents = validateItems(residentSchema, req.body.residents);
+    const removedRooms = z.array(z.string().min(1).max(20)).max(500).safeParse(req.body.removedRooms ?? []);
     for (const part of chunks(residents.valid, 50)) {
       const rows = part.map((r) => ({
         org_id: req.orgId,
@@ -764,6 +767,7 @@ app.post(
         name: r.name,
         tags: r.tags,
         photo: r.photo ?? null,
+        removed_at: null, // admitting (or editing) a room brings it back
         updated_at: nowIso(),
       }));
       const { error } = await supabase
@@ -771,7 +775,18 @@ app.post(
         .upsert(rows, { onConflict: 'org_id,room' });
       if (error) throw error;
     }
-    res.json({ ok: true, stored: residents.valid.length, rejected: residents.rejected });
+    let removed = 0;
+    if (removedRooms.success && removedRooms.data.length > 0) {
+      const { error } = await supabase
+        .from('handover_residents')
+        .update({ removed_at: nowIso(), updated_at: nowIso() })
+        .eq('org_id', req.orgId)
+        .in('room', removedRooms.data)
+        .is('removed_at', null);
+      if (error) throw error;
+      removed = removedRooms.data.length;
+    }
+    res.json({ ok: true, stored: residents.valid.length, removed, rejected: residents.rejected });
   })
 );
 
@@ -875,20 +890,26 @@ app.get(
       .eq('operational_date', date)
       .order('created_at_device');
     if (e1) throw e1;
-    const { data: residents, error: e2 } = await supabase
-      .from('handover_residents')
-      .select('room, name, tags, photo')
-      .eq('org_id', req.orgId);
-    if (e2) throw e2;
-    res.json({
-      entries: (entries || []).map(mapEntry),
-      voids: await loadVoids(req.orgId, (entries || []).map((e) => e.id)),
-      residents: (residents || []).map((r) => ({
+    // ?residents=0 skips the (possibly photo-heavy) resident list.
+    let residents;
+    if (req.query.residents !== '0') {
+      const result = await supabase
+        .from('handover_residents')
+        .select('room, name, tags, photo')
+        .eq('org_id', req.orgId)
+        .is('removed_at', null);
+      if (result.error) throw result.error;
+      residents = (result.data || []).map((r) => ({
         room: r.room,
         name: r.name,
         tags: r.tags || [],
         ...(r.photo ? { photo: r.photo } : {}),
-      })),
+      }));
+    }
+    res.json({
+      entries: (entries || []).map(mapEntry),
+      voids: await loadVoids(req.orgId, (entries || []).map((e) => e.id)),
+      ...(residents ? { residents } : {}),
     });
   })
 );
