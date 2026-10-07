@@ -393,15 +393,40 @@ const memberForDevice = (m) => ({
 async function orgPolicy(orgId) {
   const { data } = await supabase
     .from('organizations')
-    .select('name, max_offline_days, idle_logout_minutes')
+    .select('name, max_offline_days, idle_logout_minutes, pin_salt, pin_iterations')
     .eq('id', orgId)
     .single();
   return {
     organizationName: data?.name || '',
     maxOfflineDays: data?.max_offline_days ?? 14,
     idleLogoutMinutes: data?.idle_logout_minutes ?? 15,
+    pinSalt: data?.pin_salt || '',
+    pinIterations: data?.pin_iterations ?? 310000,
   };
 }
+
+// PINs are identified by a "tag" prepared with the care home's own salt, so the same PIN
+// always gives the same tag. A PIN prepared with other settings cannot be compared.
+async function pinSettingsOk(orgId, pin) {
+  const { data } = await supabase
+    .from('organizations')
+    .select('pin_salt, pin_iterations')
+    .eq('id', orgId)
+    .single();
+  return Boolean(data) && pin.salt === data.pin_salt && pin.iterations === data.pin_iterations;
+}
+
+const PIN_SETTINGS_BODY = {
+  error: 'This PIN was prepared with old settings. Refresh the page and try again.',
+  code: 'PIN_SETTINGS_CHANGED',
+};
+const PIN_TAKEN_BODY = {
+  error: 'That PIN is already used by someone else. Choose another.',
+  code: 'PIN_TAKEN',
+};
+// The database refuses a second person with the same PIN (unique index members_pin_unique).
+const isPinTaken = (error) =>
+  Boolean(error) && error.code === '23505' && /members_pin_unique/.test(`${error.message} ${error.details || ''}`);
 
 async function loadMembers(orgId) {
   const { data, error } = await supabase
@@ -551,6 +576,9 @@ app.post(
         .status(409)
         .json({ error: 'PIN was changed meanwhile', code: 'PIN_CONFLICT', member: memberForDevice(target) });
 
+    // A PIN prepared with other settings than the care home's current ones cannot be compared.
+    if (!(await pinSettingsOk(req.orgId, body.data.pin))) return res.status(400).json(PIN_SETTINGS_BODY);
+
     let mustChange = false;
     if (body.data.approvedBy) {
       const { data: approver } = await supabase
@@ -587,6 +615,11 @@ app.post(
       .eq('pin_version', target.pin_version) // optimistic lock
       .select(MEMBER_COLS)
       .maybeSingle();
+    if (isPinTaken(error)) {
+      // Someone else (on another device) already holds this PIN: this person must choose again.
+      await audit(req.orgId, 'device', req.deviceId, 'member.pin_rejected_taken', { memberId: target.id }, { ip: req.ip, deviceId: req.deviceId });
+      return res.status(409).json({ ...PIN_TAKEN_BODY, member: memberForDevice(target) });
+    }
     if (error) throw error;
     if (!updated) {
       const fresh = await supabase.from('members').select(MEMBER_COLS).eq('id', target.id).single();
@@ -902,6 +935,8 @@ app.get(
       roleKey: req.admin.roleKey,
       permissions: req.admin.permissions,
       mfa: req.admin.aal === 'aal2',
+      pinSalt: (await orgPolicy(req.orgId)).pinSalt,
+      pinIterations: (await orgPolicy(req.orgId)).pinIterations,
     });
   })
 );
@@ -987,6 +1022,8 @@ app.post(
     if (!role) return res.status(404).json({ error: 'Role not found' });
     if (!canGrant(req.admin.permissions, role.permissions))
       return res.status(403).json({ error: 'You cannot assign a role above your own', code: 'FORBIDDEN' });
+    if (body.data.pin && !(await pinSettingsOk(req.orgId, body.data.pin)))
+      return res.status(400).json(PIN_SETTINGS_BODY);
 
     const { data, error } = await supabase
       .from('members')
@@ -1009,6 +1046,7 @@ app.post(
       .select(MEMBER_COLS)
       .single();
     if (error) {
+      if (isPinTaken(error)) return res.status(409).json(PIN_TAKEN_BODY);
       if (error.code === '23505') return res.status(409).json({ error: 'That email is already in use' });
       throw error;
     }
@@ -1096,6 +1134,7 @@ app.post(
     if (!body.success) return bad(res);
     const target = await loadTarget(req, res);
     if (!target) return;
+    if (!(await pinSettingsOk(req.orgId, body.data.pin))) return res.status(400).json(PIN_SETTINGS_BODY);
     const { data, error } = await supabase
       .from('members')
       .update({
@@ -1111,7 +1150,10 @@ app.post(
       .eq('org_id', req.orgId)
       .select(MEMBER_COLS)
       .single();
-    if (error) throw error;
+    if (error) {
+      if (isPinTaken(error)) return res.status(409).json(PIN_TAKEN_BODY);
+      throw error;
+    }
     await audit(req.orgId, 'member', req.admin.id, 'member.pin_reset', { memberId: target.id }, { ip: req.ip });
     res.json({ member: memberForAdmin(data) });
   })
@@ -1130,7 +1172,16 @@ app.delete(
       return res.status(409).json({ error: 'The organization must keep at least one active manager' });
     const { error } = await supabase
       .from('members')
-      .update({ active: false, archived_at: nowIso(), updated_at: nowIso() })
+      .update({
+        active: false,
+        archived_at: nowIso(),
+        updated_at: nowIso(),
+        // an archived person can never sign in again: free their PIN for someone else
+        pin_algo: null,
+        pin_iterations: null,
+        pin_salt: null,
+        pin_hash: null,
+      })
       .eq('id', target.id)
       .eq('org_id', req.orgId);
     if (error) throw error;
