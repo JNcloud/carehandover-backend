@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI etap2-devices (2026-10-20): device rename / remove from list, 503 on database errors
+// ZNACZNIK_NOWEJ_WERSJI etap3b-invitations (2026-10-20): invite managers/deputies by e-mail
+// etap2-devices (2026-10-20): device rename / remove from list, 503 on database errors
 require('dotenv').config();
 const crypto = require('crypto');
 const express = require('express');
@@ -39,6 +40,14 @@ function keyKind(key) {
 
 // Set REQUIRE_MFA=true on Render once the manager has enrolled an authenticator app.
 const REQUIRE_MFA = process.env.REQUIRE_MFA === 'true';
+
+// Where the link in an invitation e-mail opens (must also be listed in Supabase ->
+// Authentication -> URL Configuration -> Redirect URLs).
+const INVITE_REDIRECT_URL = process.env.INVITE_REDIRECT_URL || 'https://handover-app.pages.dev/accept-invite';
+
+// Only roles that use the administrator panel or Settings can be invited to sign in with e-mail.
+const PANEL_PERMISSIONS = ['org.manage', 'members.view', 'members.manage', 'members.reset_pin', 'devices.manage', 'audit.read'];
+const usesPanel = (perms) => perms.some((p) => PANEL_PERMISSIONS.includes(p));
 
 const PERMISSIONS = [
   'org.manage',
@@ -1019,7 +1028,14 @@ app.get(
   need('members.view'),
   wrap(async (req, res) => {
     const members = await loadMembers(req.orgId);
-    res.json({ members: members.filter((m) => !m.archived_at).map(memberForAdmin) });
+    const invited = new Map();
+    const inv = await supabase.from('members').select('id, invited_at').eq('org_id', req.orgId);
+    if (!inv.error) for (const r of inv.data || []) if (r.invited_at) invited.set(r.id, r.invited_at);
+    res.json({
+      members: members
+        .filter((m) => !m.archived_at)
+        .map((m) => ({ ...memberForAdmin(m), invitedAt: invited.get(m.id) || null })),
+    });
   })
 );
 
@@ -1184,6 +1200,53 @@ app.post(
     }
     await audit(req.orgId, 'member', req.admin.id, 'member.pin_reset', { memberId: target.id }, { ip: req.ip });
     res.json({ member: memberForAdmin(data) });
+  })
+);
+
+// Invitation: an e-mail with a one-time link. The person sets their OWN password on our
+// /accept-invite page; nobody else ever knows it. Sending again is allowed (expired link).
+app.post(
+  '/admin/members/:id/invite',
+  need('members.manage'),
+  wrap(async (req, res) => {
+    const target = await loadTarget(req, res);
+    if (!target) return;
+    if (!target.email)
+      return res.status(400).json({ error: 'Add a work email to this person first (Edit).', code: 'NO_EMAIL' });
+    if (!target.active)
+      return res.status(409).json({ error: 'This person is deactivated. Reactivate them first.', code: 'INACTIVE' });
+    if (target.auth_user_id)
+      return res.status(409).json({ error: 'This person can already sign in.', code: 'HAS_LOGIN' });
+    if (!usesPanel(target.role.permissions))
+      return res.status(400).json({ error: 'This role does not use the administrator panel, so no invitation is needed. Staff on the devices use their PIN.', code: 'ROLE_NO_PANEL' });
+
+    const email = target.email.toLowerCase();
+    let sent = await supabase.auth.admin.inviteUserByEmail(email, {
+      redirectTo: INVITE_REDIRECT_URL,
+      data: { full_name: target.full_name },
+    });
+    let kind = 'invite';
+    // The address already has a sign-in account (for example an earlier invitation that was
+    // accepted elsewhere): send a "set your password" e-mail instead.
+    if (sent.error && (sent.error.code === 'email_exists' || /already been registered|already exists/i.test(sent.error.message || ''))) {
+      sent = await supabase.auth.resetPasswordForEmail(email, { redirectTo: INVITE_REDIRECT_URL });
+      kind = 'password_link';
+    }
+    if (sent.error) {
+      const msg = sent.error.message || '';
+      console.error('[invite] failed:', sent.error.status, sent.error.code, msg);
+      if (sent.error.status === 429 || /seconds|rate limit/i.test(msg))
+        return res.status(429).json({ error: 'An e-mail was sent to this address a moment ago. Wait a minute and try again.', code: 'TOO_SOON' });
+      return res.status(502).json({ error: 'The invitation e-mail could not be sent. Check the e-mail settings and try again.', code: 'EMAIL_FAILED' });
+    }
+    const upd = await supabase
+      .from('members')
+      .update({ invited_at: nowIso(), invited_by: req.admin.id })
+      .eq('id', target.id)
+      .eq('org_id', req.orgId);
+    if (upd.error) console.error('[invite] could not store invited_at:', upd.error.message);
+    await audit(req.orgId, 'member', req.admin.id, 'member.invited', { memberId: target.id, kind }, { ip: req.ip });
+    res.json({ ok: true, email });
   })
 );
 
