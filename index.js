@@ -1,3 +1,4 @@
+// ZNACZNIK_NOWEJ_WERSJI etap2-devices (2026-10-20): device rename / remove from list, 503 on database errors
 require('dotenv').config();
 const crypto = require('crypto');
 const express = require('express');
@@ -248,11 +249,17 @@ async function requireDevice(req, res, next) {
     const token = bearerOf(req);
     if (!token.startsWith('dev_'))
       return res.status(401).json({ error: 'Missing device token', code: 'NO_TOKEN' });
-    const { data: device } = await supabase
+    const { data: device, error: lookupError } = await supabase
       .from('devices')
       .select('id, org_id, revoked_at, last_seen_at')
       .eq('token_hash', sha256hex(token))
       .maybeSingle();
+    // A database hiccup must never look like "this device is unknown": the device would show
+    // "disconnected". 503 = try again later; the app keeps notes and retries.
+    if (lookupError) {
+      console.error('[auth] device lookup failed:', lookupError.message);
+      return res.status(503).json({ error: 'The server is busy. Try again in a moment.', code: 'SERVER_BUSY' });
+    }
     if (!device) return res.status(401).json({ error: 'Invalid token', code: 'INVALID_TOKEN' });
     if (device.revoked_at)
       return res.status(401).json({ error: 'Device revoked', code: 'DEVICE_REVOKED' });
@@ -1240,7 +1247,7 @@ app.get(
   wrap(async (req, res) => {
     const { data, error } = await supabase
       .from('devices')
-      .select('id, name, created_at, last_seen_at, revoked_at')
+      .select('id, name, created_at, last_seen_at, revoked_at, hidden_at')
       .eq('org_id', req.orgId)
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -1251,6 +1258,7 @@ app.get(
         pairedAt: d.created_at,
         lastSeenAt: d.last_seen_at,
         revokedAt: d.revoked_at,
+        removedAt: d.hidden_at,
       })),
     });
   })
@@ -1273,6 +1281,62 @@ app.delete(
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Device not found' });
     await audit(req.orgId, 'member', req.admin.id, 'device.revoked', { deviceId: data.id }, { ip: req.ip });
+    res.json({ ok: true });
+  })
+);
+
+// Rename: only the label changes; the old and new name go to the activity log.
+app.patch(
+  '/admin/devices/:id',
+  need('devices.manage'),
+  wrap(async (req, res) => {
+    const body = z.object({ name: z.string().trim().min(1).max(80) }).safeParse(req.body);
+    if (!uuid.safeParse(req.params.id).success || !body.success) return bad(res);
+    const { data: before, error: readError } = await supabase
+      .from('devices')
+      .select('id, name')
+      .eq('id', req.params.id)
+      .eq('org_id', req.orgId)
+      .maybeSingle();
+    if (readError) throw readError;
+    if (!before) return res.status(404).json({ error: 'Device not found' });
+    const { error } = await supabase
+      .from('devices')
+      .update({ name: body.data.name })
+      .eq('id', before.id)
+      .eq('org_id', req.orgId);
+    if (error) throw error;
+    await audit(req.orgId, 'member', req.admin.id, 'device.renamed', { deviceId: before.id, from: before.name, to: body.data.name }, { ip: req.ip });
+    res.json({ ok: true });
+  })
+);
+
+// "Remove from list" only HIDES a device that is already disconnected. Nothing is deleted:
+// notes keep their link to the device, and the activity log keeps its history.
+app.post(
+  '/admin/devices/:id/remove',
+  need('devices.manage'),
+  wrap(async (req, res) => {
+    if (!uuid.safeParse(req.params.id).success) return bad(res);
+    const { data: device, error: readError } = await supabase
+      .from('devices')
+      .select('id, name, revoked_at, hidden_at')
+      .eq('id', req.params.id)
+      .eq('org_id', req.orgId)
+      .maybeSingle();
+    if (readError) throw readError;
+    if (!device) return res.status(404).json({ error: 'Device not found' });
+    if (!device.revoked_at)
+      return res.status(409).json({ error: 'Disconnect the device first.', code: 'NOT_DISCONNECTED' });
+    if (device.hidden_at) return res.json({ ok: true });
+    const { error } = await supabase
+      .from('devices')
+      .update({ hidden_at: nowIso(), hidden_by: req.admin.id })
+      .eq('id', device.id)
+      .eq('org_id', req.orgId)
+      .not('revoked_at', 'is', null);
+    if (error) throw error;
+    await audit(req.orgId, 'member', req.admin.id, 'device.removed', { deviceId: device.id, name: device.name }, { ip: req.ip });
     res.json({ ok: true });
   })
 );
@@ -1311,3 +1375,4 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Serwer działa na porcie ${PORT}`));
+
