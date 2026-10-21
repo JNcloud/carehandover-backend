@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI etap3c-my-account (2026-10-21): my account (name, password check, email sync), reset 2FA
+// ZNACZNIK_NOWEJ_WERSJI i1-security (2026-10-21): nobody pauses own access or changes own role
+// etap3c-my-account (2026-10-21): my account (name, password check, email sync), reset 2FA
 // etap3b-invitations (2026-10-20): invite managers/deputies by e-mail
 // etap2-devices (2026-10-20): device rename / remove from list, 503 on database errors
 require('dotenv').config();
@@ -1161,12 +1162,21 @@ app.patch(
         code: 'EMAIL_SELF_SERVICE',
       });
 
+    // Your own access and role are changed only by someone else: nobody locks themselves out by
+    // mistake, and nobody raises their own level. (Archiving and 2FA reset already refuse "self".)
+    const isSelf = target.id === req.admin.id;
+    if (isSelf && body.data.active !== undefined && body.data.active !== target.active)
+      return res.status(409).json({ error: 'You cannot pause your own access. Ask another manager.', code: 'SELF' });
+    const roleChanges = body.data.roleKey !== undefined && body.data.roleKey !== target.role.key;
+    if (isSelf && roleChanges)
+      return res.status(409).json({ error: 'You cannot change your own role. Ask another manager.', code: 'SELF' });
+
     const patch = { updated_at: nowIso() };
     if (body.data.fullName !== undefined) patch.full_name = body.data.fullName;
     if (body.data.email !== undefined) patch.email = body.data.email;
     if (body.data.active !== undefined) patch.active = body.data.active;
     let losesManager = body.data.active === false;
-    if (body.data.roleKey !== undefined) {
+    if (roleChanges) {
       const role = await roleByKey(req.orgId, body.data.roleKey);
       if (!role) return res.status(404).json({ error: 'Role not found' });
       if (!canGrant(req.admin.permissions, role.permissions))
