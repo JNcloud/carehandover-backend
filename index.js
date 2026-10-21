@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI etap3b-invitations (2026-10-20): invite managers/deputies by e-mail
+// ZNACZNIK_NOWEJ_WERSJI etap3c-my-account (2026-10-21): my account (name, password check, email sync), reset 2FA
+// etap3b-invitations (2026-10-20): invite managers/deputies by e-mail
 // etap2-devices (2026-10-20): device rename / remove from list, 503 on database errors
 require('dotenv').config();
 const crypto = require('crypto');
@@ -339,9 +340,22 @@ async function loadAdmin(req) {
     console.error('[auth] sign-in refused: no active member for this account');
     return null;
   }
+  // The person changed their sign-in e-mail in My account (confirmed by Supabase): keep the
+  // staff record in step, so the panel and invitations use the address they really use.
+  const authEmail = (user.email || '').toLowerCase();
+  if (authEmail && member.email !== authEmail) {
+    const upd = await supabase
+      .from('members')
+      .update({ email: authEmail, updated_at: nowIso() })
+      .eq('id', member.id)
+      .eq('org_id', member.org_id);
+    if (upd.error) console.error('[auth] email sync failed:', upd.error.message);
+    else await audit(member.org_id, 'member', member.id, 'member.email_changed', { from: member.email, to: authEmail });
+  }
   return {
     id: member.id,
     orgId: member.org_id,
+    email: authEmail,
     name: member.full_name,
     roleKey: member.role.key,
     permissions: member.role.permissions,
@@ -969,6 +983,7 @@ app.get(
     res.json({
       id: req.admin.id,
       name: req.admin.name,
+      email: req.admin.email,
       roleKey: req.admin.roleKey,
       permissions: req.admin.permissions,
       mfa: req.admin.aal === 'aal2',
@@ -1136,6 +1151,15 @@ app.patch(
     if (!body.success || Object.keys(body.data).length === 0) return bad(res);
     const target = await loadTarget(req, res);
     if (!target) return;
+    if (
+      body.data.email !== undefined &&
+      target.auth_user_id &&
+      (body.data.email || '').toLowerCase() !== (target.email || '').toLowerCase()
+    )
+      return res.status(409).json({
+        error: 'This person signs in with this email. They change it themselves in My account.',
+        code: 'EMAIL_SELF_SERVICE',
+      });
 
     const patch = { updated_at: nowIso() };
     if (body.data.fullName !== undefined) patch.full_name = body.data.fullName;
@@ -1200,6 +1224,77 @@ app.post(
     }
     await audit(req.orgId, 'member', req.admin.id, 'member.pin_reset', { memberId: target.id }, { ip: req.ip });
     res.json({ member: memberForAdmin(data) });
+  })
+);
+
+/* ---------- my account ---------- */
+
+// Own name (shown on notes signed from now on and in the panel).
+app.patch(
+  '/admin/me',
+  need(),
+  wrap(async (req, res) => {
+    const body = z.object({ fullName: z.string().trim().min(1).max(120) }).safeParse(req.body);
+    if (!body.success) return bad(res);
+    if (body.data.fullName === req.admin.name) return res.json({ ok: true });
+    const { error } = await supabase
+      .from('members')
+      .update({ full_name: body.data.fullName, updated_at: nowIso() })
+      .eq('id', req.admin.id)
+      .eq('org_id', req.orgId);
+    if (error) throw error;
+    await audit(req.orgId, 'member', req.admin.id, 'member.renamed', { from: req.admin.name, to: body.data.fullName }, { ip: req.ip });
+    res.json({ ok: true });
+  })
+);
+
+// Before a password change the person proves they know the CURRENT password, so someone at an
+// unattended, signed-in panel cannot take the account over. Checked with a separate, throw-away
+// sign-in; at most 5 tries in 15 minutes.
+app.post(
+  '/admin/me/verify-password',
+  need(),
+  wrap(async (req, res) => {
+    const body = z.object({ password: z.string().min(1).max(200) }).safeParse(req.body);
+    if (!body.success) return bad(res);
+    if (!allow(`pwcheck:${req.admin.id}`, 5, 15 * 60_000))
+      return res.status(429).json({ error: 'Too many tries. Wait 15 minutes and try again.', code: 'TOO_MANY' });
+    if (!req.admin.email) return res.status(409).json({ error: 'No sign-in email on this account.' });
+    const check = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    const { data, error } = await check.auth.signInWithPassword({ email: req.admin.email, password: body.data.password });
+    if (data?.session) await check.auth.signOut().catch(() => {});
+    if (error || !data?.session) {
+      await audit(req.orgId, 'member', req.admin.id, 'member.password_check_failed', {}, { ip: req.ip });
+      return res.status(400).json({ error: 'That is not your current password.', code: 'WRONG_PASSWORD' });
+    }
+    res.json({ ok: true });
+  })
+);
+
+// Lost phone: another manager removes someone's authenticator app; they set it up again at their
+// next sign-in. Never for your own account (use My account), always in the activity log.
+app.post(
+  '/admin/members/:id/reset-2fa',
+  need('members.manage'),
+  wrap(async (req, res) => {
+    const target = await loadTarget(req, res);
+    if (!target) return;
+    if (target.id === req.admin.id)
+      return res.status(400).json({ error: 'For your own account use My account.', code: 'SELF' });
+    if (!target.auth_user_id)
+      return res.status(409).json({ error: 'This person does not sign in with email yet.', code: 'NO_LOGIN' });
+    const list = await supabase.auth.admin.mfa.listFactors({ userId: target.auth_user_id });
+    if (list.error) throw list.error;
+    let removed = 0;
+    for (const f of list.data?.factors || []) {
+      const del = await supabase.auth.admin.mfa.deleteFactor({ id: f.id, userId: target.auth_user_id });
+      if (del.error) throw del.error;
+      removed++;
+    }
+    await audit(req.orgId, 'member', req.admin.id, 'member.mfa_reset', { memberId: target.id, removed }, { ip: req.ip });
+    res.json({ ok: true, removed });
   })
 );
 
