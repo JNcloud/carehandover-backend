@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI i1-security (2026-10-21): nobody pauses own access or changes own role
+// ZNACZNIK_NOWEJ_WERSJI i2-past-staff (2026-10-21): past staff list, re-employ, clear email conflict
+// i1-security (2026-10-21): nobody pauses own access or changes own role
 // etap3c-my-account (2026-10-21): my account (name, password check, email sync), reset 2FA
 // etap3b-invitations (2026-10-20): invite managers/deputies by e-mail
 // etap2-devices (2026-10-20): device rename / remove from list, 503 on database errors
@@ -1055,6 +1056,24 @@ app.get(
   })
 );
 
+// The e-mail is already on someone's record (the unique index also covers people who left, so
+// their sign-in can come back with them). Says who, and for a leaver points to Re-employ.
+async function emailTakenBody(orgId, email) {
+  const { data } = await supabase
+    .from('members')
+    .select('full_name, archived_at')
+    .eq('org_id', orgId)
+    .eq('email', (email || '').toLowerCase())
+    .maybeSingle();
+  if (data?.archived_at)
+    return {
+      error: `This email belongs to ${data.full_name}, who left. To bring them back, use Re-employ under Past staff.`,
+      code: 'EMAIL_PAST_STAFF',
+    };
+  if (data) return { error: `That email is already used by ${data.full_name}.`, code: 'EMAIL_TAKEN' };
+  return { error: 'That email is already in use', code: 'EMAIL_TAKEN' };
+}
+
 async function roleByKey(orgId, key) {
   const { data } = await supabase
     .from('roles')
@@ -1107,7 +1126,7 @@ app.post(
       .single();
     if (error) {
       if (isPinTaken(error)) return res.status(409).json(PIN_TAKEN_BODY);
-      if (error.code === '23505') return res.status(409).json({ error: 'That email is already in use' });
+      if (error.code === '23505') return res.status(409).json(await emailTakenBody(req.orgId, body.data.email));
       throw error;
     }
     await audit(req.orgId, 'member', req.admin.id, 'member.created', { memberId: data.id, role: role.key }, { ip: req.ip });
@@ -1195,7 +1214,7 @@ app.patch(
       .select(MEMBER_COLS)
       .single();
     if (error) {
-      if (error.code === '23505') return res.status(409).json({ error: 'That email is already in use' });
+      if (error.code === '23505') return res.status(409).json(await emailTakenBody(req.orgId, body.data.email));
       throw error;
     }
     await audit(req.orgId, 'member', req.admin.id, 'member.updated', { memberId: target.id, changed: Object.keys(body.data) }, { ip: req.ip });
@@ -1352,6 +1371,83 @@ app.post(
     if (upd.error) console.error('[invite] could not store invited_at:', upd.error.message);
     await audit(req.orgId, 'member', req.admin.id, 'member.invited', { memberId: target.id, kind }, { ip: req.ip });
     res.json({ ok: true, email });
+  })
+);
+
+/* ---------- past staff (leavers) ---------- */
+
+// People who left. Nothing about them is deleted: their notes keep their name, and they can be
+// re-employed as the same person with the same history.
+app.get(
+  '/admin/members/past',
+  need('members.view'),
+  wrap(async (req, res) => {
+    const members = await loadMembers(req.orgId);
+    res.json({
+      members: members
+        .filter((m) => m.archived_at)
+        .sort((a, b) => String(b.archived_at).localeCompare(String(a.archived_at)))
+        .map((m) => ({ ...memberForAdmin(m), archivedAt: m.archived_at })),
+    });
+  })
+);
+
+// Someone who left comes back: the same record (so the same history), a role chosen now and a
+// new temporary PIN they replace at their first login. An e-mail sign-in they had comes back too.
+app.post(
+  '/admin/members/:id/reemploy',
+  need('members.manage'),
+  wrap(async (req, res) => {
+    if (!uuid.safeParse(req.params.id).success) return bad(res);
+    const body = z.object({ roleKey: z.string().min(1).max(40), pin: verifierSchema }).safeParse(req.body);
+    if (!body.success) return bad(res);
+    const { data: target } = await supabase
+      .from('members')
+      .select(MEMBER_COLS)
+      .eq('id', req.params.id)
+      .eq('org_id', req.orgId)
+      .maybeSingle();
+    if (!target) return res.status(404).json({ error: 'Member not found' });
+    if (!target.archived_at)
+      return res.status(409).json({ error: 'This person is already on the staff list.', code: 'NOT_LEFT' });
+    const role = await roleByKey(req.orgId, body.data.roleKey);
+    if (!role) return res.status(404).json({ error: 'Role not found' });
+    if (!canGrant(req.admin.permissions, role.permissions))
+      return res.status(403).json({ error: 'You cannot assign a role above your own', code: 'FORBIDDEN' });
+    if (!(await pinSettingsOk(req.orgId, body.data.pin))) return res.status(400).json(PIN_SETTINGS_BODY);
+
+    const { data, error } = await supabase
+      .from('members')
+      .update({
+        active: true,
+        archived_at: null,
+        role_id: role.id,
+        pin_algo: 'pbkdf2-sha256',
+        pin_iterations: body.data.pin.iterations,
+        pin_salt: body.data.pin.salt,
+        pin_hash: body.data.pin.hash,
+        pin_version: (target.pin_version || 0) + 1,
+        must_change_pin: true,
+        updated_at: nowIso(),
+      })
+      .eq('id', target.id)
+      .eq('org_id', req.orgId)
+      .not('archived_at', 'is', null)
+      .select(MEMBER_COLS)
+      .single();
+    if (error) {
+      if (isPinTaken(error)) return res.status(409).json(PIN_TAKEN_BODY);
+      throw error;
+    }
+    await audit(
+      req.orgId,
+      'member',
+      req.admin.id,
+      'member.reemployed',
+      { memberId: target.id, role: role.key, leftAt: target.archived_at },
+      { ip: req.ip }
+    );
+    res.json({ member: memberForAdmin(data) });
   })
 );
 
