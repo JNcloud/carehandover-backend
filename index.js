@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI i3-notify (2026-10-22): e-mails to full access, readable activity log
+// ZNACZNIK_NOWEJ_WERSJI i4-help (2026-10-22): test warning email
+// i3-notify (2026-10-22): e-mails to full access, readable activity log
 // i2-past-staff (2026-10-21): past staff list, re-employ, clear email conflict
 // i1-security (2026-10-21): nobody pauses own access or changes own role
 // etap3c-my-account (2026-10-21): my account (name, password check, email sync), reset 2FA
@@ -103,12 +104,7 @@ function notifyFullAccess(orgId, { event, subject, sentence, alsoTo = null }) {
       }
       const { data: org } = await supabase.from('organizations').select('name').eq('id', orgId).maybeSingle();
       const home = org?.name || 'your care home';
-      const text =
-        `${sentence}\n\nWhen: ${ukTime()} (UK time)\n\n` +
-        `You are receiving this because you have full access to ${home} in Handover, or the change is about you. ` +
-        `Everyone with full access gets these messages, so nothing important changes unnoticed.\n\n` +
-        `If you expected this, there is nothing to do. If not, sign in at ${PANEL_URL}, check Staff and the Activity log, ` +
-        `and speak to the registered manager straight away.\n\nHandover`;
+      const text = warningText(sentence, home);
       const failed = [];
       for (const to of list) {
         try {
@@ -132,6 +128,17 @@ function notifyFullAccess(orgId, { event, subject, sentence, alsoTo = null }) {
 }
 
 const hasFull = (perms) => (perms || []).includes('org.manage');
+
+// Text of a warning e-mail (also used by the supplier's recovery command).
+function warningText(sentence, home) {
+  return (
+    `${sentence}\n\nWhen: ${ukTime()} (UK time)\n\n` +
+    `You are receiving this because you have full access to ${home} in Handover, or the change is about you. ` +
+    `Everyone with full access gets these messages, so nothing important changes unnoticed.\n\n` +
+    `If you expected this, there is nothing to do. If not, sign in at ${PANEL_URL}, check Staff and the Activity log, ` +
+    `and speak to the registered manager straight away.\n\nHandover`
+  );
+}
 
 // Only roles that use the administrator panel or Settings can be invited to sign in with e-mail.
 const PANEL_PERMISSIONS = ['org.manage', 'members.view', 'members.manage', 'members.reset_pin', 'devices.manage', 'audit.read'];
@@ -1522,6 +1529,38 @@ app.post(
     if (upd.error) console.error('[invite] could not store invited_at:', upd.error.message);
     await audit(req.orgId, 'member', req.admin.id, 'member.invited', { memberId: target.id, kind }, { ip: req.ip });
     res.json({ ok: true, email });
+  })
+);
+
+/* ---------- warning e-mails: test ---------- */
+
+// "Send a test warning email": proves sending works, and keeps the Brevo key in use (a key
+// unused for 90 days expires). Goes only to the person who pressed it; the result is shown
+// at once and kept in the Activity log.
+app.post(
+  '/admin/notify/test',
+  need('org.manage'),
+  wrap(async (req, res) => {
+    if (!allow(`notifytest:${req.admin.id}`, 3, 10 * 60_000))
+      return res.status(429).json({ error: 'Wait a few minutes before sending another test.', code: 'TOO_MANY' });
+    if (!req.admin.email) return res.status(409).json({ error: 'Your account has no email address.', code: 'NO_EMAIL' });
+    if (!notifyConfigured()) {
+      await audit(req.orgId, 'member', req.admin.id, 'notify.test', { ok: false, reason: 'Email notifications are not set up on the server yet.' }, { ip: req.ip });
+      return res.status(503).json({ error: 'Warning emails are not set up on the server yet (BREVO_API_KEY on Render).', code: 'NOT_SET_UP' });
+    }
+    const { data: org } = await supabase.from('organizations').select('name').eq('id', req.orgId).maybeSingle();
+    try {
+      await sendEmail(
+        { email: req.admin.email, name: req.admin.name },
+        'Handover: test warning email',
+        warningText(`This is a test. ${req.admin.name} checked that Handover can send warning emails. Nothing has changed.`, org?.name || 'your care home')
+      );
+    } catch (e) {
+      await audit(req.orgId, 'member', req.admin.id, 'notify.test', { ok: false, reason: e.message }, { ip: req.ip });
+      return res.status(502).json({ error: `The test email could not be sent: ${e.message}`, code: 'EMAIL_FAILED' });
+    }
+    await audit(req.orgId, 'member', req.admin.id, 'notify.test', { ok: true, to: req.admin.email }, { ip: req.ip });
+    res.json({ ok: true, to: req.admin.email });
   })
 );
 
