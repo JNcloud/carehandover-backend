@@ -1,4 +1,4 @@
-// RECOVERY COMMAND FOR THE SUPPLIER (I.4, 2026-10-22).
+// RECOVERY COMMAND FOR THE SUPPLIER (I.4, 2026-10-22, v2: cleans the address, checks the key type).
 //
 // For the rare case when NOBODY with full access can sign in to a care home's panel any more
 // (for example: the only manager left suddenly, or lost their phone and password at once).
@@ -53,7 +53,18 @@ async function main(argv, say = console.log) {
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY)
     return fail(say, 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are missing in the .env file next to recover.js (copy them from Render -> Environment).');
 
-  const db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+  // Only the project address counts (a copied ".../rest/v1/" ending is ignored).
+  let url;
+  try {
+    url = new URL(process.env.SUPABASE_URL.trim()).origin;
+  } catch {
+    return fail(say, 'SUPABASE_URL in .env is not a web address. It should look like https://abcd1234.supabase.co');
+  }
+  const kind = keyKind(process.env.SUPABASE_SERVICE_ROLE_KEY.trim());
+  if (kind !== 'ok') return fail(say, `SUPABASE_SERVICE_ROLE_KEY in .env is ${kind}. Use the SECRET key (the same as on Render).`);
+  say(`Database:    ${url}`);
+
+  const db = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY.trim(), {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
@@ -153,6 +164,21 @@ async function main(argv, say = console.log) {
     : `The email could NOT be sent (${mail.error.message}). Run the command again in a minute.`);
   say('This is recorded in the Activity log as "Supplier recovery".');
   return { ok: true, dryRun: false, steps, mailOk, removed };
+}
+
+// Says what kind of key it is, never the key itself.
+function keyKind(key) {
+  if (key.startsWith('sb_secret_')) return 'ok';
+  if (key.startsWith('sb_publishable_')) return 'the PUBLISHABLE key (wrong one)';
+  if (key.startsWith('eyJ')) {
+    try {
+      const role = JSON.parse(Buffer.from(key.split('.')[1], 'base64url').toString('utf8')).role;
+      return role === 'service_role' ? 'ok' : `a key with role "${role}" (wrong one)`;
+    } catch {
+      return 'unreadable';
+    }
+  }
+  return 'in an unknown format';
 }
 
 function fail(say, text) {
