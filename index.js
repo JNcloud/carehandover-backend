@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI i2-past-staff (2026-10-21): past staff list, re-employ, clear email conflict
+// ZNACZNIK_NOWEJ_WERSJI i3-notify (2026-10-22): e-mails to full access, readable activity log
+// i2-past-staff (2026-10-21): past staff list, re-employ, clear email conflict
 // i1-security (2026-10-21): nobody pauses own access or changes own role
 // etap3c-my-account (2026-10-21): my account (name, password check, email sync), reset 2FA
 // etap3b-invitations (2026-10-20): invite managers/deputies by e-mail
@@ -47,6 +48,90 @@ const REQUIRE_MFA = process.env.REQUIRE_MFA === 'true';
 // Where the link in an invitation e-mail opens (must also be listed in Supabase ->
 // Authentication -> URL Configuration -> Redirect URLs).
 const INVITE_REDIRECT_URL = process.env.INVITE_REDIRECT_URL || 'https://handover-app.pages.dev/accept-invite';
+
+/* ---------- e-mail notifications to everyone with full access (I.3) ---------- */
+// Sent through Brevo's e-mail API. Render variables (typed by the owner in the Render dashboard,
+// never in code): BREVO_API_KEY and NOTIFY_FROM_EMAIL (a sender verified in Brevo), optionally
+// NOTIFY_FROM_NAME and PANEL_URL. Without them nothing is sent, and the Activity log says so.
+// A notification never blocks or undoes the change it is about; every attempt is in the log.
+const PANEL_URL = process.env.PANEL_URL || 'https://handover-app.pages.dev/admin';
+const notifyConfigured = () => Boolean(process.env.BREVO_API_KEY && process.env.NOTIFY_FROM_EMAIL);
+console.log(`[startup] e-mail notifications: ${notifyConfigured() ? 'ON' : 'OFF (BREVO_API_KEY / NOTIFY_FROM_EMAIL not set)'}`);
+
+const ukTime = (d = new Date()) =>
+  d.toLocaleString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'long', year: 'numeric' });
+
+async function sendEmail(to, subject, text) {
+  const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({
+      sender: { email: process.env.NOTIFY_FROM_EMAIL, name: process.env.NOTIFY_FROM_NAME || 'Handover' },
+      to: [{ email: to.email, ...(to.name ? { name: to.name } : {}) }],
+      subject,
+      textContent: text,
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) {
+    const body = await r.text().catch(() => '');
+    throw new Error(`Brevo ${r.status}: ${body.slice(0, 200)}`);
+  }
+}
+
+/**
+ * Tells everyone with full access (active, with an e-mail) about an important change, and
+ * optionally the person it is about. Runs in the background; the outcome goes to the Activity log.
+ * event: short key for the log; subject: e-mail subject; sentence: what happened, in one line.
+ */
+function notifyFullAccess(orgId, { event, subject, sentence, alsoTo = null }) {
+  const job = (async () => {
+    try {
+      const members = await loadMembers(orgId);
+      const list = members
+        .filter((m) => m.active && !m.archived_at && m.email && m.role.permissions.includes('org.manage'))
+        .map((m) => ({ email: m.email.toLowerCase(), name: m.full_name }));
+      if (alsoTo?.email && !list.some((x) => x.email === alsoTo.email.toLowerCase()))
+        list.push({ email: alsoTo.email.toLowerCase(), name: alsoTo.name });
+      if (!notifyConfigured()) {
+        await audit(orgId, 'system', null, 'notify.skipped', { event, subject, reason: 'Email notifications are not set up on the server yet.' });
+        return;
+      }
+      if (list.length === 0) {
+        await audit(orgId, 'system', null, 'notify.skipped', { event, subject, reason: 'Nobody with full access has an email address.' });
+        return;
+      }
+      const { data: org } = await supabase.from('organizations').select('name').eq('id', orgId).maybeSingle();
+      const home = org?.name || 'your care home';
+      const text =
+        `${sentence}\n\nWhen: ${ukTime()} (UK time)\n\n` +
+        `You are receiving this because you have full access to ${home} in Handover, or the change is about you. ` +
+        `Everyone with full access gets these messages, so nothing important changes unnoticed.\n\n` +
+        `If you expected this, there is nothing to do. If not, sign in at ${PANEL_URL}, check Staff and the Activity log, ` +
+        `and speak to the registered manager straight away.\n\nHandover`;
+      const failed = [];
+      for (const to of list) {
+        try {
+          await sendEmail(to, `Handover: ${subject}`, text);
+        } catch (e) {
+          console.error('[notify] failed:', e.message);
+          failed.push({ to: to.email, reason: e.message });
+        }
+      }
+      const sent = list.length - failed.length;
+      if (sent > 0) await audit(orgId, 'system', null, 'notify.sent', { event, subject, to: sent });
+      if (failed.length > 0)
+        await audit(orgId, 'system', null, 'notify.failed', { event, subject, failed: failed.length, reason: failed[0].reason });
+    } catch (e) {
+      console.error('[notify] crashed:', e);
+      await audit(orgId, 'system', null, 'notify.failed', { event, subject, reason: e.message || 'unknown' });
+    }
+  })();
+  (globalThis.__notifyJobs = globalThis.__notifyJobs || []).push(job);
+  return job;
+}
+
+const hasFull = (perms) => (perms || []).includes('org.manage');
 
 // Only roles that use the administrator panel or Settings can be invited to sign in with e-mail.
 const PANEL_PERMISSIONS = ['org.manage', 'members.view', 'members.manage', 'members.reset_pin', 'devices.manage', 'audit.read'];
@@ -352,7 +437,16 @@ async function loadAdmin(req) {
       .eq('id', member.id)
       .eq('org_id', member.org_id);
     if (upd.error) console.error('[auth] email sync failed:', upd.error.message);
-    else await audit(member.org_id, 'member', member.id, 'member.email_changed', { from: member.email, to: authEmail });
+    else {
+      await audit(member.org_id, 'member', member.id, 'member.email_changed', { from: member.email, to: authEmail });
+      if (hasFull(member.role.permissions))
+        notifyFullAccess(member.org_id, {
+          event: 'email_changed',
+          subject: `${member.full_name} changed their sign-in email`,
+          sentence: `${member.full_name} (full access) changed their sign-in email from ${member.email || '(none)'} to ${authEmail}.`,
+          alsoTo: member.email ? { email: member.email, name: member.full_name } : null,
+        });
+    }
   }
   return {
     id: member.id,
@@ -1130,6 +1224,12 @@ app.post(
       throw error;
     }
     await audit(req.orgId, 'member', req.admin.id, 'member.created', { memberId: data.id, role: role.key }, { ip: req.ip });
+    if (hasFull(role.permissions))
+      notifyFullAccess(req.orgId, {
+        event: 'full_access_granted',
+        subject: `${data.full_name} was given full access`,
+        sentence: `${req.admin.name} added ${data.full_name} as ${role.name}. This role has full access: it can change staff, roles and settings.`,
+      });
     res.json({ member: memberForAdmin(data) });
   })
 );
@@ -1187,6 +1287,7 @@ app.patch(
     if (isSelf && body.data.active !== undefined && body.data.active !== target.active)
       return res.status(409).json({ error: 'You cannot pause your own access. Ask another manager.', code: 'SELF' });
     const roleChanges = body.data.roleKey !== undefined && body.data.roleKey !== target.role.key;
+    let newRole = null;
     if (isSelf && roleChanges)
       return res.status(409).json({ error: 'You cannot change your own role. Ask another manager.', code: 'SELF' });
 
@@ -1201,6 +1302,7 @@ app.patch(
       if (!canGrant(req.admin.permissions, role.permissions))
         return res.status(403).json({ error: 'You cannot assign a role above your own', code: 'FORBIDDEN' });
       patch.role_id = role.id;
+      newRole = role;
       if (!role.permissions.includes('org.manage')) losesManager = true;
     }
     if (losesManager && (await isLastManager(req.orgId, target.id)))
@@ -1217,7 +1319,49 @@ app.patch(
       if (error.code === '23505') return res.status(409).json(await emailTakenBody(req.orgId, body.data.email));
       throw error;
     }
-    await audit(req.orgId, 'member', req.admin.id, 'member.updated', { memberId: target.id, changed: Object.keys(body.data) }, { ip: req.ip });
+    // Only what really changed, with before/after for the role and access (readable Activity log).
+    const changed = [];
+    if (body.data.fullName !== undefined && body.data.fullName !== target.full_name) changed.push('name');
+    if (body.data.email !== undefined && (body.data.email || '') !== (target.email || '')) changed.push('email');
+    if (roleChanges) changed.push('role');
+    const accessChanges = body.data.active !== undefined && body.data.active !== target.active;
+    if (accessChanges) changed.push('access');
+    await audit(
+      req.orgId,
+      'member',
+      req.admin.id,
+      'member.updated',
+      {
+        memberId: target.id,
+        changed,
+        ...(roleChanges ? { roleFrom: target.role.key, roleTo: newRole.key } : {}),
+        ...(accessChanges ? { active: body.data.active } : {}),
+      },
+      { ip: req.ip }
+    );
+    const wasFull = hasFull(target.role.permissions);
+    const nowFull = roleChanges ? hasFull(newRole.permissions) : wasFull;
+    if (roleChanges && !wasFull && nowFull)
+      notifyFullAccess(req.orgId, {
+        event: 'full_access_granted',
+        subject: `${target.full_name} was given full access`,
+        sentence: `${req.admin.name} changed ${target.full_name}'s role from ${target.role.name} to ${newRole.name}. This role has full access: it can change staff, roles and settings.`,
+      });
+    if (roleChanges && wasFull && !nowFull)
+      notifyFullAccess(req.orgId, {
+        event: 'full_access_removed',
+        subject: `${target.full_name} no longer has full access`,
+        sentence: `${req.admin.name} changed ${target.full_name}'s role from ${target.role.name} to ${newRole.name}. They no longer have full access.`,
+        alsoTo: target.email ? { email: target.email, name: target.full_name } : null,
+      });
+    if (accessChanges && (wasFull || nowFull))
+      notifyFullAccess(req.orgId, {
+        event: body.data.active ? 'access_restored' : 'access_paused',
+        subject: body.data.active ? `${target.full_name}'s access was restored` : `${target.full_name}'s access was paused`,
+        sentence: body.data.active
+          ? `${req.admin.name} restored access for ${target.full_name} (full access). They can sign in again.`
+          : `${req.admin.name} paused access for ${target.full_name} (full access). They cannot sign in until access is restored.`,
+      });
     res.json({ member: memberForAdmin(data) });
   })
 );
@@ -1323,6 +1467,13 @@ app.post(
       removed++;
     }
     await audit(req.orgId, 'member', req.admin.id, 'member.mfa_reset', { memberId: target.id, removed }, { ip: req.ip });
+    if (removed > 0)
+      notifyFullAccess(req.orgId, {
+        event: 'mfa_reset',
+        subject: `The authenticator app for ${target.full_name} was reset`,
+        sentence: `${req.admin.name} reset the authenticator app (two-step sign-in) for ${target.full_name}. At their next sign-in they set it up again on their phone.`,
+        alsoTo: target.email ? { email: target.email, name: target.full_name } : null,
+      });
     res.json({ ok: true, removed });
   })
 );
@@ -1447,6 +1598,12 @@ app.post(
       { memberId: target.id, role: role.key, leftAt: target.archived_at },
       { ip: req.ip }
     );
+    if (hasFull(role.permissions))
+      notifyFullAccess(req.orgId, {
+        event: 'full_access_granted',
+        subject: `${target.full_name} is back with full access`,
+        sentence: `${req.admin.name} re-employed ${target.full_name} as ${role.name}. This role has full access: it can change staff, roles and settings.`,
+      });
     res.json({ member: memberForAdmin(data) });
   })
 );
@@ -1478,6 +1635,12 @@ app.delete(
       .eq('org_id', req.orgId);
     if (error) throw error;
     await audit(req.orgId, 'member', req.admin.id, 'member.archived', { memberId: target.id }, { ip: req.ip });
+    if (hasFull(target.role.permissions))
+      notifyFullAccess(req.orgId, {
+        event: 'leaver',
+        subject: `${target.full_name} was marked as a leaver`,
+        sentence: `${req.admin.name} marked ${target.full_name} (${target.role.name}, full access) as a leaver. They can no longer sign in. Everything they wrote stays in the records.`,
+      });
     res.json({ ok: true });
   })
 );
@@ -1622,7 +1785,32 @@ app.get(
     if (Number.isFinite(before)) query = query.lt('id', before);
     const { data, error } = await query;
     if (error) throw error;
-    res.json({ events: data || [] });
+    // Names instead of ids, so the log reads like sentences. Includes people who left.
+    const members = await loadMembers(req.orgId);
+    const person = new Map(members.map((m) => [m.id, m.full_name]));
+    const devs = await supabase.from('devices').select('id, name').eq('org_id', req.orgId);
+    const device = new Map((devs.data || []).map((d) => [d.id, d.name]));
+    const roles = await supabase.from('roles').select('key, name').eq('org_id', req.orgId);
+    const roleName = new Map((roles.data || []).map((r) => [r.key, r.name]));
+    const pick = (map, id) => (id && map.has(String(id)) ? map.get(String(id)) : null);
+    res.json({
+      events: (data || []).map((e) => {
+        const d = e.detail || {};
+        const deviceId = e.device_id || d.deviceId || (e.actor_type === 'device' && device.has(String(e.actor_id)) ? e.actor_id : null);
+        return {
+          ...e,
+          names: {
+            actor: pick(person, e.actor_id),
+            subject: pick(person, d.memberId),
+            approver: pick(person, d.approvedBy),
+            device: pick(device, deviceId),
+            role: pick(roleName, d.role),
+            roleFrom: pick(roleName, d.roleFrom),
+            roleTo: pick(roleName, d.roleTo),
+          },
+        };
+      }),
+    });
   })
 );
 
