@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI i4-help (2026-10-22): test warning email
+// ZNACZNIK_NOWEJ_WERSJI i5-2fa (2026-10-26): compulsory two-step sign-in without lock-out
+// i4-help (2026-10-22): test warning email
 // i3-notify (2026-10-22): e-mails to full access, readable activity log
 // i2-past-staff (2026-10-21): past staff list, re-employ, clear email conflict
 // i1-security (2026-10-21): nobody pauses own access or changes own role
@@ -467,13 +468,16 @@ async function loadAdmin(req) {
 }
 
 // Usage: need('members.manage'). With no arguments: any signed-in member.
-const need =
-  (...perms) =>
+// With REQUIRE_MFA=true every request needs the authenticator code (aal2). The one exception is
+// GET /admin/me (needSetupAllowed): it tells someone without an authenticator app yet that they
+// must set it up first, so nobody is locked out and nothing else opens until they have.
+const guard =
+  (allowSetup, perms) =>
   async (req, res, next) => {
     try {
       const admin = await loadAdmin(req);
       if (!admin) return res.status(401).json({ error: 'Sign-in required', code: 'NO_ADMIN' });
-      if (REQUIRE_MFA && admin.aal !== 'aal2')
+      if (REQUIRE_MFA && admin.aal !== 'aal2' && !allowSetup)
         return res.status(403).json({ error: 'Second factor required', code: 'MFA_REQUIRED' });
       if (perms.some((p) => !admin.permissions.includes(p)))
         return res.status(403).json({ error: 'Not allowed', code: 'FORBIDDEN' });
@@ -485,6 +489,16 @@ const need =
       res.status(500).json({ error: 'Server error' });
     }
   };
+const need = (...perms) => guard(false, perms);
+const needSetupAllowed = () => guard(true, []);
+
+// Has this sign-in account a confirmed authenticator app? (null = could not check)
+async function hasTwoStep(authUserId) {
+  if (!authUserId) return false;
+  const list = await supabase.auth.admin.mfa.listFactors({ userId: authUserId });
+  if (list.error) return null;
+  return (list.data?.factors || []).some((f) => !f.status || f.status === 'verified');
+}
 
 /* ================================================================== */
 /* Views                                                               */
@@ -1081,7 +1095,7 @@ app.get(
 
 app.get(
   '/admin/me',
-  need(),
+  needSetupAllowed(),
   wrap(async (req, res) => {
     res.json({
       id: req.admin.id,
@@ -1090,6 +1104,10 @@ app.get(
       roleKey: req.admin.roleKey,
       permissions: req.admin.permissions,
       mfa: req.admin.aal === 'aal2',
+      // Two-step sign-in is compulsory on this server, and this sign-in has not used it yet:
+      // the app shows only "Set up two-step sign-in" until it is done.
+      twoStepRequired: REQUIRE_MFA,
+      mfaSetupNeeded: REQUIRE_MFA && req.admin.aal !== 'aal2',
       pinSalt: (await orgPolicy(req.orgId)).pinSalt,
       pinIterations: (await orgPolicy(req.orgId)).pinIterations,
     });
@@ -1149,10 +1167,18 @@ app.get(
     const invited = new Map();
     const inv = await supabase.from('members').select('id, invited_at').eq('org_id', req.orgId);
     if (!inv.error) for (const r of inv.data || []) if (r.invited_at) invited.set(r.id, r.invited_at);
+    const active = members.filter((m) => !m.archived_at);
+    // Who has set up two-step sign-in (only people who sign in with email).
+    const twoStep = new Map(
+      await Promise.all(active.filter((m) => m.auth_user_id).map(async (m) => [m.id, await hasTwoStep(m.auth_user_id)]))
+    );
     res.json({
-      members: members
-        .filter((m) => !m.archived_at)
-        .map((m) => ({ ...memberForAdmin(m), invitedAt: invited.get(m.id) || null })),
+      twoStepRequired: REQUIRE_MFA,
+      members: active.map((m) => ({
+        ...memberForAdmin(m),
+        invitedAt: invited.get(m.id) || null,
+        twoStep: m.auth_user_id ? (twoStep.get(m.id) ?? null) : null,
+      })),
     });
   })
 );
