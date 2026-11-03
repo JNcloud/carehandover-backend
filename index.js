@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI p1-rooms (2026-11-02): rooms with areas, residents with their own id, notes follow the person
+// ZNACZNIK_NOWEJ_WERSJI p3-away (2026-11-03): temporary moves (usual room held) and Away / In hospital
+// p1-rooms (2026-11-02): rooms with areas, residents with their own id, notes follow the person
 // Handover (c) 2026 Jozef Nowakowski. All rights reserved. Proprietary software: see LICENSE.
 // i5-2fa (2026-10-26): compulsory two-step sign-in without lock-out
 // i4-help (2026-10-22): test warning email
@@ -299,6 +300,13 @@ const voidSchema = z.object({
   checksum: hex64,
 });
 
+const awaySchema = z.object({
+  reason: z.enum(['hospital', 'family', 'other']),
+  note: z.string().trim().max(200).optional(),
+  since: isoInstant,
+  expectedBack: isoDate.optional(),
+});
+
 const residentSchema = z.object({
   // Each resident has their own id (from p1-rooms); older apps send only the room.
   id: uuid.optional(),
@@ -306,11 +314,15 @@ const residentSchema = z.object({
   name: z.string().max(200),
   tags: z.array(z.string().max(80)).max(50),
   photo: z.string().max(4000000).optional(),
+  // p3: living in another room for now; their usual room is held for them.
+  homeRoom: room.nullable().optional(),
+  // p3: away from the home (hospital, family...). They stay on the list and their room is held.
+  away: awaySchema.nullable().optional(),
 });
 
 const historySchema = z.object({
   id: z.string().min(3).max(300),
-  type: z.enum(['admitted', 'released']),
+  type: z.enum(['admitted', 'released', 'away', 'returned']),
   room,
   name: z.string().max(200),
   tags: z.array(z.string().max(80)).max(50),
@@ -325,6 +337,8 @@ const historySchema = z.object({
   shift: shiftKey,
   sequence: z.number().int().nonnegative(),
   residentId: uuid.optional(),
+  homeRoom: room.optional(),
+  away: awaySchema.optional(),
 });
 
 const eventSchema = z.object({
@@ -912,6 +926,33 @@ app.post(
 
 // Residents that changed on this device, plus residents who left. A release is a soft removal
 // (removed_at), so it reaches the other devices and nothing is ever deleted.
+// p3: temporary move and Away are kept in their own columns (null when not in use).
+function statusColumns(r) {
+  const home = r.homeRoom && r.homeRoom.toLowerCase() !== r.room.toLowerCase() ? r.homeRoom : null;
+  return {
+    home_room: home,
+    away_reason: r.away ? r.away.reason : null,
+    away_note: r.away ? r.away.note || null : null,
+    away_since: r.away ? r.away.since : null,
+    away_until: r.away ? r.away.expectedBack || null : null,
+  };
+}
+function statusFields(r) {
+  return {
+    ...(r.home_room ? { homeRoom: r.home_room } : {}),
+    ...(r.away_reason
+      ? {
+          away: {
+            reason: r.away_reason,
+            ...(r.away_note ? { note: r.away_note } : {}),
+            since: new Date(r.away_since).toISOString(),
+            ...(r.away_until ? { expectedBack: String(r.away_until).slice(0, 10) } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
 // From p1-rooms each resident has their own id, so two people can share a room. Older apps send
 // only the room: their resident is matched to the one person in that room, as before.
 app.post(
@@ -922,19 +963,25 @@ app.post(
     const removedRooms = z.array(z.string().min(1).max(20)).max(500).safeParse(req.body.removedRooms ?? []);
     const removedIds = z.array(uuid).max(500).safeParse(req.body.removedIds ?? []);
     const stamp = () => ({ removed_at: null, updated_at: nowIso() }); // admitting (or editing) brings it back
+    // Apps from p3 always send homeRoom and away (null when none). Older apps do not know them,
+    // so their rows are saved without those columns and never clear a status set on another device.
+    const knowsAway = (r) => r.homeRoom !== undefined || r.away !== undefined;
     const withId = residents.valid.filter((r) => r.id);
-    for (const part of chunks(withId, 50)) {
-      const rows = part.map((r) => ({
-        org_id: req.orgId,
-        id: r.id,
-        room: r.room,
-        name: r.name,
-        tags: r.tags,
-        photo: r.photo ?? null,
-        ...stamp(),
-      }));
-      const { error } = await supabase.from('handover_residents').upsert(rows, { onConflict: 'org_id,id' });
-      if (error) throw error;
+    for (const group of [withId.filter(knowsAway), withId.filter((r) => !knowsAway(r))]) {
+      for (const part of chunks(group, 50)) {
+        const rows = part.map((r) => ({
+          org_id: req.orgId,
+          id: r.id,
+          room: r.room,
+          name: r.name,
+          tags: r.tags,
+          photo: r.photo ?? null,
+          ...(knowsAway(r) ? statusColumns(r) : {}),
+          ...stamp(),
+        }));
+        const { error } = await supabase.from('handover_residents').upsert(rows, { onConflict: 'org_id,id' });
+        if (error) throw error;
+      }
     }
     for (const r of residents.valid.filter((x) => !x.id)) {
       const { data: inRoom, error: readError } = await supabase
@@ -944,7 +991,7 @@ app.post(
         .eq('room', r.room)
         .is('removed_at', null);
       if (readError) throw readError;
-      const fields = { room: r.room, name: r.name, tags: r.tags, photo: r.photo ?? null, ...stamp() };
+      const fields = { room: r.room, name: r.name, tags: r.tags, photo: r.photo ?? null, ...(knowsAway(r) ? statusColumns(r) : {}), ...stamp() };
       const { error } =
         (inRoom || []).length === 1
           ? await supabase.from('handover_residents').update(fields).eq('org_id', req.orgId).eq('id', inRoom[0].id)
@@ -1104,7 +1151,7 @@ app.get(
     if (req.query.residents !== '0') {
       const result = await supabase
         .from('handover_residents')
-        .select('id, room, name, tags, photo')
+        .select('id, room, name, tags, photo, home_room, away_reason, away_note, away_since, away_until')
         .eq('org_id', req.orgId)
         .is('removed_at', null);
       if (result.error) throw result.error;
@@ -1114,6 +1161,7 @@ app.get(
         name: r.name,
         tags: r.tags || [],
         ...(r.photo ? { photo: r.photo } : {}),
+        ...statusFields(r),
       }));
     }
     res.json({
@@ -1901,15 +1949,32 @@ app.post(
 // Devices pick rooms from this list, and a full room cannot take another resident.
 // Nothing is deleted: "Remove from list" only hides an empty room.
 
-async function roomOccupants(orgId) {
+// Who lives in each room, and (p3) whose usual room it is while they are in another room for now.
+// A held bed counts as taken: removing the room or lowering its beds must not push anyone out.
+async function roomPeople(orgId) {
   const { data, error } = await supabase
     .from('handover_residents')
-    .select('id, room, name')
+    .select('id, room, name, home_room, away_reason, away_note, away_since, away_until')
     .eq('org_id', orgId)
     .is('removed_at', null);
   if (error) throw error;
   const byRoom = new Map();
-  for (const r of data || []) byRoom.set(r.room.toLowerCase(), [...(byRoom.get(r.room.toLowerCase()) || []), r.name]);
+  const at = (label) => {
+    const key = label.toLowerCase();
+    if (!byRoom.has(key)) byRoom.set(key, { living: [], heldFor: [] });
+    return byRoom.get(key);
+  };
+  for (const r of data || []) {
+    const status = statusFields(r);
+    at(r.room).living.push({ name: r.name, ...status });
+    if (status.homeRoom) at(status.homeRoom).heldFor.push({ name: r.name, now: r.room });
+  }
+  return byRoom;
+}
+async function roomOccupants(orgId) {
+  const people = await roomPeople(orgId);
+  const byRoom = new Map();
+  for (const [key, p] of people) byRoom.set(key, [...p.living.map((x) => x.name), ...p.heldFor.map((x) => `${x.name} (held, now in Room ${x.now})`)]);
   return byRoom;
 }
 
@@ -1918,8 +1983,13 @@ app.get(
   need('org.manage'),
   wrap(async (req, res) => {
     const rooms = await loadRooms(req.orgId);
-    const occupants = await roomOccupants(req.orgId);
-    res.json({ rooms: rooms.map((r) => ({ ...r, residents: occupants.get(r.label.toLowerCase()) || [] })) });
+    const people = await roomPeople(req.orgId);
+    res.json({
+      rooms: rooms.map((r) => {
+        const p = people.get(r.label.toLowerCase()) || { living: [], heldFor: [] };
+        return { ...r, residents: p.living.map((x) => x.name), people: p.living, heldFor: p.heldFor };
+      }),
+    });
   })
 );
 
