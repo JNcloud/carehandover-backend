@@ -1,4 +1,6 @@
-// ZNACZNIK_NOWEJ_WERSJI i5-2fa (2026-10-26): compulsory two-step sign-in without lock-out
+// ZNACZNIK_NOWEJ_WERSJI p1-rooms (2026-11-02): rooms with areas, residents with their own id, notes follow the person
+// Handover (c) 2026 Jozef Nowakowski. All rights reserved. Proprietary software: see LICENSE.
+// i5-2fa (2026-10-26): compulsory two-step sign-in without lock-out
 // i4-help (2026-10-22): test warning email
 // i3-notify (2026-10-22): e-mails to full access, readable activity log
 // i2-past-staff (2026-10-21): past staff list, re-employ, clear email conflict
@@ -281,6 +283,9 @@ const entrySchema = z.object({
   authorName: z.string().min(1).max(120),
   authorRole: z.string().max(80),
   createdAt: isoInstant,
+  // The person the note is about (from p1-rooms). Older apps send only the room.
+  residentId: uuid.optional(),
+  residentName: z.string().min(1).max(200).optional(),
   checksum: hex64,
 });
 
@@ -294,6 +299,8 @@ const voidSchema = z.object({
 });
 
 const residentSchema = z.object({
+  // Each resident has their own id (from p1-rooms); older apps send only the room.
+  id: uuid.optional(),
   room,
   name: z.string().max(200),
   tags: z.array(z.string().max(80)).max(50),
@@ -316,6 +323,7 @@ const historySchema = z.object({
   operationalDate: isoDate,
   shift: shiftKey,
   sequence: z.number().int().nonnegative(),
+  residentId: uuid.optional(),
 });
 
 const eventSchema = z.object({
@@ -842,6 +850,8 @@ app.post(
         author_role: e.authorRole,
         created_at_device: e.createdAt,
         device_id: req.deviceId, // taken from the token, never from the client
+        resident_id: e.residentId ?? null,
+        resident_name: e.residentName ?? null,
         checksum: e.checksum,
       }));
       const { error } = await supabase
@@ -899,30 +909,58 @@ app.post(
   })
 );
 
-// Residents that changed on this device, plus rooms that were released. A release is a soft
-// removal (removed_at), so it reaches the other devices and nothing is ever deleted.
+// Residents that changed on this device, plus residents who left. A release is a soft removal
+// (removed_at), so it reaches the other devices and nothing is ever deleted.
+// From p1-rooms each resident has their own id, so two people can share a room. Older apps send
+// only the room: their resident is matched to the one person in that room, as before.
 app.post(
   '/sync/residents',
   requireDevice,
   wrap(async (req, res) => {
     const residents = validateItems(residentSchema, req.body.residents);
     const removedRooms = z.array(z.string().min(1).max(20)).max(500).safeParse(req.body.removedRooms ?? []);
-    for (const part of chunks(residents.valid, 50)) {
+    const removedIds = z.array(uuid).max(500).safeParse(req.body.removedIds ?? []);
+    const stamp = () => ({ removed_at: null, updated_at: nowIso() }); // admitting (or editing) brings it back
+    const withId = residents.valid.filter((r) => r.id);
+    for (const part of chunks(withId, 50)) {
       const rows = part.map((r) => ({
         org_id: req.orgId,
+        id: r.id,
         room: r.room,
         name: r.name,
         tags: r.tags,
         photo: r.photo ?? null,
-        removed_at: null, // admitting (or editing) a room brings it back
-        updated_at: nowIso(),
+        ...stamp(),
       }));
-      const { error } = await supabase
+      const { error } = await supabase.from('handover_residents').upsert(rows, { onConflict: 'org_id,id' });
+      if (error) throw error;
+    }
+    for (const r of residents.valid.filter((x) => !x.id)) {
+      const { data: inRoom, error: readError } = await supabase
         .from('handover_residents')
-        .upsert(rows, { onConflict: 'org_id,room' });
+        .select('id')
+        .eq('org_id', req.orgId)
+        .eq('room', r.room)
+        .is('removed_at', null);
+      if (readError) throw readError;
+      const fields = { room: r.room, name: r.name, tags: r.tags, photo: r.photo ?? null, ...stamp() };
+      const { error } =
+        (inRoom || []).length === 1
+          ? await supabase.from('handover_residents').update(fields).eq('org_id', req.orgId).eq('id', inRoom[0].id)
+          : await supabase.from('handover_residents').insert({ org_id: req.orgId, id: crypto.randomUUID(), ...fields });
       if (error) throw error;
     }
     let removed = 0;
+    if (removedIds.success && removedIds.data.length > 0) {
+      const { error } = await supabase
+        .from('handover_residents')
+        .update({ removed_at: nowIso(), updated_at: nowIso() })
+        .eq('org_id', req.orgId)
+        .in('id', removedIds.data)
+        .is('removed_at', null);
+      if (error) throw error;
+      removed += removedIds.data.length;
+    }
     if (removedRooms.success && removedRooms.data.length > 0) {
       const { error } = await supabase
         .from('handover_residents')
@@ -931,7 +969,7 @@ app.post(
         .in('room', removedRooms.data)
         .is('removed_at', null);
       if (error) throw error;
-      removed = removedRooms.data.length;
+      removed += removedRooms.data.length;
     }
     res.json({ ok: true, stored: residents.valid.length, removed, rejected: residents.rejected });
   })
@@ -986,6 +1024,26 @@ app.post(
   })
 );
 
+/* ---------- rooms (p1-rooms) ---------- */
+
+const roomLabel = z.string().trim().min(1).max(20).regex(/^[A-Za-z0-9][A-Za-z0-9 \-\/]*$/);
+const areaName = z.string().trim().min(1).max(40);
+const bedCount = z.number().int().min(1).max(4);
+
+/** The room list of a care home, in its own order (Main House first, then Cottage, ...). */
+async function loadRooms(orgId) {
+  const { data, error } = await supabase
+    .from('handover_rooms')
+    .select('id, label, area, beds, position')
+    .eq('org_id', orgId)
+    .is('archived_at', null)
+    .order('position');
+  if (error) throw error;
+  return (data || [])
+    .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+    .map((r) => ({ id: r.id, label: r.label, area: r.area, beds: r.beds, position: r.position ?? 0 }));
+}
+
 const mapEntry = (n) => ({
   id: n.id,
   date: n.operational_date,
@@ -997,6 +1055,9 @@ const mapEntry = (n) => ({
   authorRole: n.author_role,
   createdAt: new Date(n.created_at_device).toISOString(),
   receivedAt: new Date(n.received_at).toISOString(),
+  // Only present on notes written by the new app: the signature covers exactly what was sent.
+  ...(n.resident_id ? { residentId: n.resident_id } : {}),
+  ...(n.resident_name ? { residentName: n.resident_name } : {}),
   checksum: n.checksum,
 });
 
@@ -1042,11 +1103,12 @@ app.get(
     if (req.query.residents !== '0') {
       const result = await supabase
         .from('handover_residents')
-        .select('room, name, tags, photo')
+        .select('id, room, name, tags, photo')
         .eq('org_id', req.orgId)
         .is('removed_at', null);
       if (result.error) throw result.error;
       residents = (result.data || []).map((r) => ({
+        id: r.id,
         room: r.room,
         name: r.name,
         tags: r.tags || [],
@@ -1056,7 +1118,7 @@ app.get(
     res.json({
       entries: (entries || []).map(mapEntry),
       voids: await loadVoids(req.orgId, (entries || []).map((e) => e.id)),
-      ...(residents ? { residents } : {}),
+      ...(residents ? { residents, rooms: await loadRooms(req.orgId) } : {}),
     });
   })
 );
@@ -1080,7 +1142,7 @@ app.get(
       query = query.eq('shift', shift.data);
     }
     const q = String(req.query.q || '').replace(/[,()%*\\]/g, ' ').trim();
-    if (q) query = query.or(`text.ilike.%${q}%,room.ilike.%${q}%,author_name.ilike.%${q}%`);
+    if (q) query = query.or(`text.ilike.%${q}%,room.ilike.%${q}%,author_name.ilike.%${q}%,resident_name.ilike.%${q}%`);
     const { data, error } = await query;
     if (error) throw error;
     const voids = await loadVoids(req.orgId, (data || []).map((e) => e.id));
@@ -1829,6 +1891,103 @@ app.post(
       .not('revoked_at', 'is', null);
     if (error) throw error;
     await audit(req.orgId, 'member', req.admin.id, 'device.removed', { deviceId: device.id, name: device.name }, { ip: req.ip });
+    res.json({ ok: true });
+  })
+);
+
+/* ---------- rooms and areas (p1-rooms) ---------- */
+// The room list of the home: label ("12", "1C"), area ("Main House", "Cottage") and beds.
+// Devices pick rooms from this list, and a full room cannot take another resident.
+// Nothing is deleted: "Remove from list" only hides an empty room.
+
+async function roomOccupants(orgId) {
+  const { data, error } = await supabase
+    .from('handover_residents')
+    .select('id, room, name')
+    .eq('org_id', orgId)
+    .is('removed_at', null);
+  if (error) throw error;
+  const byRoom = new Map();
+  for (const r of data || []) byRoom.set(r.room.toLowerCase(), [...(byRoom.get(r.room.toLowerCase()) || []), r.name]);
+  return byRoom;
+}
+
+app.get(
+  '/admin/rooms',
+  need('org.manage'),
+  wrap(async (req, res) => {
+    const rooms = await loadRooms(req.orgId);
+    const occupants = await roomOccupants(req.orgId);
+    res.json({ rooms: rooms.map((r) => ({ ...r, residents: occupants.get(r.label.toLowerCase()) || [] })) });
+  })
+);
+
+app.post(
+  '/admin/rooms',
+  need('org.manage'),
+  wrap(async (req, res) => {
+    const body = z.object({ label: roomLabel, area: areaName, beds: bedCount }).safeParse(req.body);
+    if (!body.success) return bad(res, 'Give a room number (letters, numbers), an area and 1 to 4 beds.');
+    const rooms = await loadRooms(req.orgId);
+    if (rooms.some((r) => r.label.toLowerCase() === body.data.label.toLowerCase()))
+      return res.status(409).json({ error: `Room ${body.data.label} is already on the list.`, code: 'ROOM_EXISTS' });
+    const position = rooms.reduce((max, r) => Math.max(max, r.position), 0) + 1;
+    const row = { org_id: req.orgId, id: crypto.randomUUID(), label: body.data.label, area: body.data.area, beds: body.data.beds, position };
+    const { error } = await supabase.from('handover_rooms').insert(row);
+    if (error) throw error;
+    await audit(req.orgId, 'member', req.admin.id, 'room.added', { roomId: row.id, label: row.label, area: row.area, beds: row.beds }, { ip: req.ip });
+    res.json({ ok: true, room: { id: row.id, label: row.label, area: row.area, beds: row.beds, position } });
+  })
+);
+
+app.patch(
+  '/admin/rooms/:id',
+  need('org.manage'),
+  wrap(async (req, res) => {
+    const body = z.object({ area: areaName.optional(), beds: bedCount.optional() }).safeParse(req.body);
+    if (!uuid.safeParse(req.params.id).success || !body.success) return bad(res);
+    const room = (await loadRooms(req.orgId)).find((r) => r.id === req.params.id);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    const next = { area: body.data.area ?? room.area, beds: body.data.beds ?? room.beds };
+    const living = (await roomOccupants(req.orgId)).get(room.label.toLowerCase()) || [];
+    if (next.beds < living.length)
+      return res.status(409).json({
+        error: `Room ${room.label} has ${living.length} residents now (${living.join(', ')}), so it needs at least ${living.length} beds.`,
+        code: 'ROOM_OCCUPIED',
+      });
+    if (next.area === room.area && next.beds === room.beds) return res.json({ ok: true });
+    const { error } = await supabase
+      .from('handover_rooms')
+      .update({ ...next, updated_at: nowIso() })
+      .eq('org_id', req.orgId)
+      .eq('id', room.id);
+    if (error) throw error;
+    await audit(
+      req.orgId, 'member', req.admin.id, 'room.updated',
+      { roomId: room.id, label: room.label, areaFrom: room.area, areaTo: next.area, bedsFrom: room.beds, bedsTo: next.beds },
+      { ip: req.ip }
+    );
+    res.json({ ok: true });
+  })
+);
+
+app.post(
+  '/admin/rooms/:id/remove',
+  need('org.manage'),
+  wrap(async (req, res) => {
+    if (!uuid.safeParse(req.params.id).success) return bad(res);
+    const room = (await loadRooms(req.orgId)).find((r) => r.id === req.params.id);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    const living = (await roomOccupants(req.orgId)).get(room.label.toLowerCase()) || [];
+    if (living.length > 0)
+      return res.status(409).json({ error: `Room ${room.label} is not empty (${living.join(', ')}).`, code: 'ROOM_OCCUPIED' });
+    const { error } = await supabase
+      .from('handover_rooms')
+      .update({ archived_at: nowIso(), updated_at: nowIso() })
+      .eq('org_id', req.orgId)
+      .eq('id', room.id);
+    if (error) throw error;
+    await audit(req.orgId, 'member', req.admin.id, 'room.removed', { roomId: room.id, label: room.label, area: room.area }, { ip: req.ip });
     res.json({ ok: true });
   })
 );
