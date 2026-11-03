@@ -38,11 +38,12 @@ function keyKind(key) {
 }
 (async () => {
   console.log(`[startup] Supabase key: ${keyKind(process.env.SUPABASE_SERVICE_ROLE_KEY)}`);
-  const { count, error } = await supabase.from('organizations').select('id', { count: 'exact', head: true });
+  // A normal read (not a HEAD request): a refused read then shows its real reason in the log.
+  const { data, error } = await supabase.from('organizations').select('id').limit(5);
   console.log(
     error
-      ? `[startup] database check FAILED: ${error.message}`
-      : `[startup] database check OK, organizations visible: ${count} (expected at least 1)`
+      ? `[startup] database check FAILED: ${error.code || ''} ${error.message}`
+      : `[startup] database check OK, organizations visible: ${(data || []).length} (expected at least 1)`
   );
 })().catch((e) => console.error('[startup] self-check crashed:', e.message));
 
