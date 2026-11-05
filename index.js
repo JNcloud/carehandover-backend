@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI p3-away (2026-11-03): temporary moves (usual room held) and Away / In hospital
+// ZNACZNIK_NOWEJ_WERSJI p4-roles (2026-11-05): roles edited in the panel (ticks), residents.away permission
+// p3-away (2026-11-03): temporary moves (usual room held) and Away / In hospital
 // p1-rooms (2026-11-02): rooms with areas, residents with their own id, notes follow the person
 // Handover (c) 2026 Jozef Nowakowski. All rights reserved. Proprietary software: see LICENSE.
 // i5-2fa (2026-10-26): compulsory two-step sign-in without lock-out
@@ -146,7 +147,7 @@ function warningText(sentence, home) {
 }
 
 // Only roles that use the administrator panel or Settings can be invited to sign in with e-mail.
-const PANEL_PERMISSIONS = ['org.manage', 'members.view', 'members.manage', 'members.reset_pin', 'devices.manage', 'audit.read'];
+const PANEL_PERMISSIONS = ['org.manage', 'roles.manage', 'members.view', 'members.manage', 'members.reset_pin', 'devices.manage', 'audit.read'];
 const usesPanel = (perms) => perms.some((p) => PANEL_PERMISSIONS.includes(p));
 
 const PERMISSIONS = [
@@ -161,6 +162,7 @@ const PERMISSIONS = [
   'notes.void',
   'notes.approve',
   'residents.manage',
+  'residents.away', // p4: mark a resident away (hospital, family) and back
 ];
 
 const app = express();
@@ -1260,11 +1262,181 @@ app.get(
   wrap(async (req, res) => {
     const { data, error } = await supabase
       .from('roles')
-      .select('id, key, name, permissions, is_system')
+      .select('id, key, name, permissions, is_system, archived_at')
       .eq('org_id', req.orgId)
       .order('name');
     if (error) throw error;
-    res.json({ roles: data || [], allPermissions: PERMISSIONS });
+    const members = await loadMembers(req.orgId);
+    const usedBy = (id) => members.filter((m) => !m.archived_at && m.role.id === id).map((m) => m.full_name);
+    res.json({
+      roles: (data || []).map((r) => ({ ...r, usedBy: usedBy(r.id), protected: r.key === PROTECTED_ROLE })),
+      allPermissions: PERMISSIONS,
+    });
+  })
+);
+
+/* ---------- roles (p4): the manager creates roles and ticks what each may do ---------- */
+
+// The registered manager's role always keeps every permission, so the home can never lock itself out.
+const PROTECTED_ROLE = 'registered_manager';
+const roleNameSchema = z.string().trim().min(1).max(60);
+const permissionsSchema = z
+  .array(z.enum(PERMISSIONS))
+  .max(PERMISSIONS.length)
+  .transform((list) => PERMISSIONS.filter((p) => list.includes(p))); // no duplicates, fixed order
+
+async function loadRole(orgId, id) {
+  if (!uuid.safeParse(id).success) return null;
+  const { data } = await supabase
+    .from('roles')
+    .select('id, key, name, permissions, is_system, archived_at')
+    .eq('org_id', orgId)
+    .eq('id', id)
+    .maybeSingle();
+  return data;
+}
+
+async function roleNameTaken(orgId, name, exceptId = null) {
+  const { data, error } = await supabase.from('roles').select('id, name').eq('org_id', orgId).is('archived_at', null);
+  if (error) throw error;
+  return (data || []).some((r) => r.id !== exceptId && r.name.trim().toLowerCase() === name.trim().toLowerCase());
+}
+
+const roleKeyFrom = (name) =>
+  `custom_${name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 24) || 'role'}_${crypto
+    .randomUUID()
+    .slice(0, 6)}`;
+
+app.post(
+  '/admin/roles',
+  need('roles.manage'),
+  wrap(async (req, res) => {
+    const body = z.object({ name: roleNameSchema, permissions: permissionsSchema }).safeParse(req.body);
+    if (!body.success) return bad(res);
+    const { name, permissions } = body.data;
+    if (!canGrant(req.admin.permissions, permissions))
+      return res.status(403).json({ error: 'You cannot give a role something you cannot do yourself.', code: 'FORBIDDEN' });
+    if (await roleNameTaken(req.orgId, name))
+      return res.status(409).json({ error: `There is already a role called ${name}.`, code: 'ROLE_NAME_TAKEN' });
+    const { data, error } = await supabase
+      .from('roles')
+      .insert({ org_id: req.orgId, key: roleKeyFrom(name), name, permissions, is_system: false })
+      .select('id, key, name, permissions, is_system, archived_at')
+      .single();
+    if (error) throw error;
+    await audit(req.orgId, 'member', req.admin.id, 'role.created', { name, permissions }, { ip: req.ip });
+    if (hasFull(permissions))
+      notifyFullAccess(req.orgId, {
+        event: 'role.created',
+        subject: 'a new role with full access',
+        sentence: `${req.admin.name} created the role ${name}. This role has full access: it can change staff, roles and settings.`,
+      });
+    res.json({ role: data });
+  })
+);
+
+app.patch(
+  '/admin/roles/:id',
+  need('roles.manage'),
+  wrap(async (req, res) => {
+    const body = z
+      .object({ name: roleNameSchema.optional(), permissions: permissionsSchema.optional() })
+      .safeParse(req.body);
+    if (!body.success) return bad(res);
+    const role = await loadRole(req.orgId, req.params.id);
+    if (!role) return res.status(404).json({ error: 'Role not found' });
+    if (role.archived_at) return res.status(409).json({ error: 'This role is archived. Restore it first.', code: 'ARCHIVED' });
+    if (role.key === PROTECTED_ROLE)
+      return res.status(409).json({ error: 'The Registered Manager role always has full access and cannot be changed.', code: 'PROTECTED' });
+    if (role.key === req.admin.roleKey)
+      return res.status(409).json({ error: 'You cannot change your own role. Ask another manager.', code: 'SELF' });
+    if (!canGrant(req.admin.permissions, role.permissions))
+      return res.status(403).json({ error: 'You cannot change a role that can do more than you.', code: 'FORBIDDEN' });
+    const name = body.data.name ?? role.name;
+    const permissions = body.data.permissions ?? role.permissions;
+    if (!canGrant(req.admin.permissions, permissions))
+      return res.status(403).json({ error: 'You cannot give a role something you cannot do yourself.', code: 'FORBIDDEN' });
+    if (name !== role.name && (await roleNameTaken(req.orgId, name, role.id)))
+      return res.status(409).json({ error: `There is already a role called ${name}.`, code: 'ROLE_NAME_TAKEN' });
+
+    const added = permissions.filter((p) => !role.permissions.includes(p));
+    const removed = role.permissions.filter((p) => !permissions.includes(p));
+    if (removed.includes('org.manage')) {
+      // Somebody outside this role must keep full access.
+      const members = await loadMembers(req.orgId);
+      const others = members.filter((m) => m.active && !m.archived_at && m.role.id !== role.id && hasFull(m.role.permissions));
+      if (others.length === 0)
+        return res.status(409).json({ error: 'Nobody else would have full access. Give someone else full access first.', code: 'LAST_FULL_ACCESS' });
+    }
+    if (name === role.name && added.length === 0 && removed.length === 0) return res.json({ role });
+
+    const { data, error } = await supabase
+      .from('roles')
+      .update({ name, permissions })
+      .eq('org_id', req.orgId)
+      .eq('id', role.id)
+      .select('id, key, name, permissions, is_system, archived_at')
+      .single();
+    if (error) throw error;
+    await audit(
+      req.orgId,
+      'member',
+      req.admin.id,
+      'role.updated',
+      { name, ...(name !== role.name ? { nameFrom: role.name } : {}), added, removed },
+      { ip: req.ip }
+    );
+    if (added.includes('org.manage') || removed.includes('org.manage'))
+      notifyFullAccess(req.orgId, {
+        event: 'role.updated',
+        subject: added.includes('org.manage') ? 'a role was given full access' : 'a role lost full access',
+        sentence: added.includes('org.manage')
+          ? `${req.admin.name} gave the role ${name} full access: everyone with this role can now change staff, roles and settings.`
+          : `${req.admin.name} removed full access from the role ${name}.`,
+      });
+    res.json({ role: data });
+  })
+);
+
+app.post(
+  '/admin/roles/:id/archive',
+  need('roles.manage'),
+  wrap(async (req, res) => {
+    const role = await loadRole(req.orgId, req.params.id);
+    if (!role) return res.status(404).json({ error: 'Role not found' });
+    if (role.archived_at) return res.json({ ok: true });
+    if (role.key === PROTECTED_ROLE)
+      return res.status(409).json({ error: 'The Registered Manager role cannot be archived.', code: 'PROTECTED' });
+    if (!canGrant(req.admin.permissions, role.permissions))
+      return res.status(403).json({ error: 'You cannot change a role that can do more than you.', code: 'FORBIDDEN' });
+    const members = await loadMembers(req.orgId);
+    const using = members.filter((m) => !m.archived_at && m.role.id === role.id).map((m) => m.full_name);
+    if (using.length > 0)
+      return res
+        .status(409)
+        .json({ error: `${using.join(', ')} still ${using.length === 1 ? 'has' : 'have'} this role. Give them another role first.`, code: 'ROLE_IN_USE' });
+    const { error } = await supabase.from('roles').update({ archived_at: nowIso() }).eq('org_id', req.orgId).eq('id', role.id);
+    if (error) throw error;
+    await audit(req.orgId, 'member', req.admin.id, 'role.archived', { name: role.name }, { ip: req.ip });
+    res.json({ ok: true });
+  })
+);
+
+app.post(
+  '/admin/roles/:id/restore',
+  need('roles.manage'),
+  wrap(async (req, res) => {
+    const role = await loadRole(req.orgId, req.params.id);
+    if (!role) return res.status(404).json({ error: 'Role not found' });
+    if (!role.archived_at) return res.json({ ok: true });
+    if (!canGrant(req.admin.permissions, role.permissions))
+      return res.status(403).json({ error: 'You cannot change a role that can do more than you.', code: 'FORBIDDEN' });
+    if (await roleNameTaken(req.orgId, role.name, role.id))
+      return res.status(409).json({ error: `There is already a role called ${role.name}. Rename that one first.`, code: 'ROLE_NAME_TAKEN' });
+    const { error } = await supabase.from('roles').update({ archived_at: null }).eq('org_id', req.orgId).eq('id', role.id);
+    if (error) throw error;
+    await audit(req.orgId, 'member', req.admin.id, 'role.restored', { name: role.name }, { ip: req.ip });
+    res.json({ ok: true });
   })
 );
 
@@ -1312,12 +1484,14 @@ async function emailTakenBody(orgId, email) {
   return { error: 'That email is already in use', code: 'EMAIL_TAKEN' };
 }
 
+// Archived roles (p4) can no longer be given to anyone.
 async function roleByKey(orgId, key) {
   const { data } = await supabase
     .from('roles')
     .select('id, key, name, permissions')
     .eq('org_id', orgId)
     .eq('key', key)
+    .is('archived_at', null)
     .maybeSingle();
   return data;
 }
