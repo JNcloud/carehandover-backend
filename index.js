@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI p5-notes (2026-11-10): Notes in the administrator panel (read, report, print, write, cross out)
+// ZNACZNIK_NOWEJ_WERSJI p6-export (2026-11-10): export notes (PDF / Excel), one resident or all, logged and announced
+// p5-notes (2026-11-10): Notes in the administrator panel (read, report, print, write, cross out)
 // p4-roles (2026-11-05): roles edited in the panel (ticks), residents.away permission
 // p3-away (2026-11-03): temporary moves (usual room held) and Away / In hospital
 // p1-rooms (2026-11-02): rooms with areas, residents with their own id, notes follow the person
@@ -148,7 +149,7 @@ function warningText(sentence, home) {
 }
 
 // Only roles that use the administrator panel or Settings can be invited to sign in with e-mail.
-const PANEL_PERMISSIONS = ['org.manage', 'roles.manage', 'notes.view', 'members.view', 'members.manage', 'members.reset_pin', 'devices.manage', 'audit.read'];
+const PANEL_PERMISSIONS = ['org.manage', 'roles.manage', 'notes.view', 'notes.export', 'members.view', 'members.manage', 'members.reset_pin', 'devices.manage', 'audit.read'];
 const usesPanel = (perms) => perms.some((p) => PANEL_PERMISSIONS.includes(p));
 
 const PERMISSIONS = [
@@ -165,6 +166,7 @@ const PERMISSIONS = [
   'residents.manage',
   'residents.away', // p4: mark a resident away (hospital, family) and back
   'notes.view', // p5: read (and, with notes.write, write) notes in the administrator panel
+  'notes.export', // p6: export notes (PDF / Excel); every export is logged and announced
 ];
 
 const app = express();
@@ -1504,6 +1506,132 @@ app.post(
     if (!body.success) return bad(res);
     await audit(req.orgId, 'member', req.admin.id, 'notes.printed', body.data, { ip: req.ip });
     res.json({ ok: true });
+  })
+);
+
+/* ---------- export notes (p6) ---------- */
+// A copy of the notes for the home: a date range, an area or one person (for example a request from a
+// family, a hospital or CQC). Crossed-out notes are included with the reason. Taking data out of the
+// system is the biggest data-protection risk, so every export is in the activity log and everyone
+// with full access gets an email.
+
+const EXPORT_MAX_DAYS = 366;
+const exportQuery = z.object({
+  from: isoDate,
+  to: isoDate,
+  area: z.string().trim().min(1).max(80).optional(),
+  residentId: uuid.optional(),
+  format: z.enum(['pdf', 'csv']).optional(),
+});
+const daysBetween = (a, b) => Math.round((Date.parse(`${b}T12:00:00Z`) - Date.parse(`${a}T12:00:00Z`)) / 86400000);
+
+// Every note in a date range, page by page (the database hands out at most 1000 rows at a time).
+async function notesBetween(orgId, from, to, residentId) {
+  const out = [];
+  for (let start = 0; ; start += 1000) {
+    let q = supabase
+      .from('note_entries')
+      .select('*, device:devices(name)')
+      .eq('org_id', orgId)
+      .gte('operational_date', from)
+      .lte('operational_date', to);
+    if (residentId) q = q.eq('resident_id', residentId);
+    const { data, error } = await q.order('operational_date').order('created_at_device').order('id').range(start, start + 999);
+    if (error) throw error;
+    out.push(...(data || []));
+    if (!data || data.length < 1000) return out;
+  }
+}
+
+function checkRange(query, res) {
+  const parsed = exportQuery.safeParse(query);
+  if (!parsed.success) return bad(res, 'Choose the dates again.') && null;
+  const { from, to } = parsed.data;
+  if (from > to) return bad(res, 'The first date must not be after the last date.') && null;
+  if (daysBetween(from, to) + 1 > EXPORT_MAX_DAYS)
+    return bad(res, `One export can cover at most ${EXPORT_MAX_DAYS} days. Make two exports.`) && null;
+  return parsed.data;
+}
+
+// Who notes were written about in a range: everyone on the list now, plus anyone who has left.
+app.get(
+  '/admin/notes/people',
+  need('notes.view', 'notes.export'),
+  wrap(async (req, res) => {
+    const range = checkRange(req.query, res);
+    if (!range) return;
+    const rows = await notesBetween(req.orgId, range.from, range.to);
+    const { data: current, error } = await supabase
+      .from('handover_residents')
+      .select('id, room, name')
+      .eq('org_id', req.orgId)
+      .is('removed_at', null);
+    if (error) throw error;
+    const people = new Map((current || []).map((r) => [r.id, { id: r.id, name: r.name, room: r.room, onList: true, notes: 0 }]));
+    for (const n of rows) {
+      if (!n.resident_id) continue;
+      if (!people.has(n.resident_id))
+        people.set(n.resident_id, { id: n.resident_id, name: n.resident_name || `Room ${n.room}`, room: n.room, onList: false, notes: 0 });
+      people.get(n.resident_id).notes += 1;
+    }
+    res.json({ people: [...people.values()] });
+  })
+);
+
+app.get(
+  '/admin/notes/export',
+  need('notes.view', 'notes.export'),
+  wrap(async (req, res) => {
+    const range = checkRange(req.query, res);
+    if (!range) return;
+    const { from, to, area, residentId, format } = range;
+    const rooms = await loadRooms(req.orgId);
+    const areaOfRoom = new Map(rooms.map((r) => [r.label.toLowerCase(), r.area]));
+    let rows = await notesBetween(req.orgId, from, to, residentId);
+    if (area) rows = rows.filter((n) => areaOfRoom.get(String(n.room).toLowerCase()) === area);
+    const voids = await loadVoids(req.orgId, rows.map((n) => n.id));
+    const voidOf = new Map(voids.map((v) => [v.entryId, v]));
+    const members = await loadMembers(req.orgId);
+    const nameOf = new Map(members.map((m) => [m.id, m.full_name]));
+    const org = await supabase.from('organizations').select('name').eq('id', req.orgId).maybeSingle();
+    const residentName = residentId ? rows[0]?.resident_name || null : null;
+
+    const scope = residentId ? `about ${residentName || 'one resident'}` : area ? `for ${area}` : 'for all areas';
+    const kind = format === 'csv' ? 'an Excel file' : format === 'pdf' ? 'a PDF / print-out' : 'a copy';
+    await audit(
+      req.orgId,
+      'member',
+      req.admin.id,
+      'notes.exported',
+      { from, to, area: area || null, residentId: residentId || null, resident: residentName, format: format || null, count: rows.length },
+      { ip: req.ip }
+    );
+    notifyFullAccess(req.orgId, {
+      event: 'notes.exported',
+      subject: 'notes were exported',
+      sentence: `${req.admin.name} exported ${rows.length} ${rows.length === 1 ? 'note' : 'notes'} ${scope}, from ${from} to ${to}, as ${kind}. If you did not expect this, check the activity log.`,
+    });
+
+    res.json({
+      from,
+      to,
+      area: area || null,
+      residentId: residentId || null,
+      residentName,
+      homeName: org.data?.name || '',
+      exportedBy: req.admin.name,
+      exportedAt: nowIso(),
+      rooms,
+      entries: rows.map((n) => {
+        const v = voidOf.get(n.id);
+        return {
+          ...mapEntry(n),
+          source: n.source === PANEL_SOURCE ? PANEL_SOURCE : 'device',
+          ...(n.device?.name ? { deviceName: n.device.name } : {}),
+          ...(v ? { voided: { byName: nameOf.get(v.voidedBy) || 'Unknown', reason: v.reason, at: v.createdAt } } : {}),
+        };
+      }),
+    });
   })
 );
 
