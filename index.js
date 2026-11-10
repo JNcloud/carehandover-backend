@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI p4-roles (2026-11-05): roles edited in the panel (ticks), residents.away permission
+// ZNACZNIK_NOWEJ_WERSJI p5-notes (2026-11-10): Notes in the administrator panel (read, report, print, write, cross out)
+// p4-roles (2026-11-05): roles edited in the panel (ticks), residents.away permission
 // p3-away (2026-11-03): temporary moves (usual room held) and Away / In hospital
 // p1-rooms (2026-11-02): rooms with areas, residents with their own id, notes follow the person
 // Handover (c) 2026 Jozef Nowakowski. All rights reserved. Proprietary software: see LICENSE.
@@ -147,7 +148,7 @@ function warningText(sentence, home) {
 }
 
 // Only roles that use the administrator panel or Settings can be invited to sign in with e-mail.
-const PANEL_PERMISSIONS = ['org.manage', 'roles.manage', 'members.view', 'members.manage', 'members.reset_pin', 'devices.manage', 'audit.read'];
+const PANEL_PERMISSIONS = ['org.manage', 'roles.manage', 'notes.view', 'members.view', 'members.manage', 'members.reset_pin', 'devices.manage', 'audit.read'];
 const usesPanel = (perms) => perms.some((p) => PANEL_PERMISSIONS.includes(p));
 
 const PERMISSIONS = [
@@ -163,6 +164,7 @@ const PERMISSIONS = [
   'notes.approve',
   'residents.manage',
   'residents.away', // p4: mark a resident away (hospital, family) and back
+  'notes.view', // p5: read (and, with notes.write, write) notes in the administrator panel
 ];
 
 const app = express();
@@ -487,6 +489,7 @@ async function loadAdmin(req) {
     email: authEmail,
     name: member.full_name,
     roleKey: member.role.key,
+    roleName: member.role.name,
     permissions: member.role.permissions,
     aal: jwtAal(token),
   };
@@ -1094,6 +1097,31 @@ async function loadRooms(orgId) {
     .map((r) => ({ id: r.id, label: r.label, area: r.area, beds: r.beds, position: r.position ?? 0 }));
 }
 
+/* ---------- p5: notes in the administrator panel ---------- */
+
+// The home's clock decides "today", whatever time zone the server runs in.
+const HOME_TIME_ZONE = process.env.HOME_TIME_ZONE || 'Europe/London';
+const DAY_ROLLOVER_HOUR = 8; // an operational day runs 08:00 -> 07:59
+const LATE_ENTRY_UNTIL_HOUR = 12; // the previous day takes late entries until 12:00
+function homeClock(now = new Date()) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-GB', { timeZone: HOME_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' })
+      .formatToParts(now)
+      .map((p) => [p.type, p.value])
+  );
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour) };
+}
+const addDays = (iso, delta) => {
+  const d = new Date(`${iso}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
+};
+function homeDays(now = new Date()) {
+  const { date, hour } = homeClock(now);
+  const today = hour < DAY_ROLLOVER_HOUR ? addDays(date, -1) : date;
+  return { today, previous: addDays(today, -1), lateOpen: hour >= DAY_ROLLOVER_HOUR && hour < LATE_ENTRY_UNTIL_HOUR };
+}
+
 const mapEntry = (n) => ({
   id: n.id,
   date: n.operational_date,
@@ -1272,6 +1300,210 @@ app.get(
       roles: (data || []).map((r) => ({ ...r, usedBy: usedBy(r.id), protected: r.key === PROTECTED_ROLE })),
       allPermissions: PERMISSIONS,
     });
+  })
+);
+
+/* ---------- notes in the administrator panel (p5) ---------- */
+// The same notes as on the devices: read by day, the shift report and print, writing and crossing out.
+// A note written here is signed by the person signed in (email, password and authenticator code),
+// marked "from the administrator panel", and reaches every device at its next sync.
+
+const PANEL_SOURCE = 'panel';
+
+app.get(
+  '/admin/notes/day',
+  need('notes.view'),
+  wrap(async (req, res) => {
+    const date = String(req.query.date || '');
+    if (!isoDate.safeParse(date).success) return bad(res, 'Bad date');
+    const { data: entries, error } = await supabase
+      .from('note_entries')
+      .select('*, device:devices(name)')
+      .eq('org_id', req.orgId)
+      .eq('operational_date', date)
+      .order('created_at_device');
+    if (error) throw error;
+    const voids = await loadVoids(req.orgId, (entries || []).map((e) => e.id));
+    const members = await loadMembers(req.orgId);
+    const nameOf = new Map(members.map((m) => [m.id, m.full_name]));
+    const voidOf = new Map(voids.map((v) => [v.entryId, v]));
+    const result = await supabase
+      .from('handover_residents')
+      .select('id, room, name, tags, photo, home_room, away_reason, away_note, away_since, away_until')
+      .eq('org_id', req.orgId)
+      .is('removed_at', null);
+    if (result.error) throw result.error;
+
+    // Reading residents' notes is recorded once a day per person (not on every click).
+    const days = homeDays();
+    const seen = await supabase
+      .from('audit_log')
+      .select('id')
+      .eq('org_id', req.orgId)
+      .eq('action', 'notes.viewed')
+      .eq('actor_id', String(req.admin.id))
+      .eq('detail->>day', days.today)
+      .limit(1);
+    if (!seen.error && (seen.data || []).length === 0)
+      await audit(req.orgId, 'member', req.admin.id, 'notes.viewed', { day: days.today, date }, { ip: req.ip });
+
+    const org = await supabase.from('organizations').select('name').eq('id', req.orgId).maybeSingle();
+    res.json({
+      date,
+      homeName: org.data?.name || '',
+      today: days.today,
+      previous: days.previous,
+      lateOpen: days.lateOpen,
+      entries: (entries || []).map((n) => {
+        const v = voidOf.get(n.id);
+        return {
+          ...mapEntry(n),
+          source: n.source === PANEL_SOURCE ? PANEL_SOURCE : 'device',
+          ...(n.device?.name ? { deviceName: n.device.name } : {}),
+          ...(v ? { voided: { byName: nameOf.get(v.voidedBy) || 'Unknown', reason: v.reason, at: v.createdAt } } : {}),
+        };
+      }),
+      residents: (result.data || []).map((r) => ({
+        id: r.id,
+        room: r.room,
+        name: r.name,
+        tags: r.tags || [],
+        ...(r.photo ? { photo: r.photo } : {}),
+        ...statusFields(r),
+      })),
+      rooms: await loadRooms(req.orgId),
+    });
+  })
+);
+
+app.post(
+  '/admin/notes',
+  need('notes.view', 'notes.write'),
+  wrap(async (req, res) => {
+    const body = z
+      .object({ date: isoDate, shift: shiftKey, residentId: uuid, text: z.string().trim().min(1).max(10000) })
+      .safeParse(req.body);
+    if (!body.success) return bad(res);
+    const { date, shift, residentId, text } = body.data;
+    // Same rule as on the devices: today, or the previous day until 12:00 as a late entry.
+    const days = homeDays();
+    if (date !== days.today && !(date === days.previous && days.lateOpen))
+      return res.status(409).json({
+        error:
+          date === days.previous
+            ? 'Late entries for the previous day can be added until 12:00.'
+            : 'Notes can only be added for today (and late entries for yesterday until 12:00).',
+        code: 'DAY_CLOSED',
+      });
+    const { data: resident, error: e1 } = await supabase
+      .from('handover_residents')
+      .select('id, room, name')
+      .eq('org_id', req.orgId)
+      .eq('id', residentId)
+      .is('removed_at', null)
+      .maybeSingle();
+    if (e1) throw e1;
+    if (!resident) return res.status(404).json({ error: 'This resident is no longer on the list.', code: 'NO_RESIDENT' });
+
+    const entryBody = {
+      id: `${date}|${resident.id}|${shift}|panel|${crypto.randomUUID()}`,
+      date,
+      room: resident.room,
+      shift,
+      text,
+      authorId: req.admin.id,
+      authorName: req.admin.name,
+      authorRole: req.admin.roleName || '',
+      createdAt: nowIso(),
+      residentId: resident.id,
+      residentName: resident.name,
+    };
+    const checksum = sha256(entryBody);
+    const { error } = await supabase.from('note_entries').insert({
+      org_id: req.orgId,
+      id: entryBody.id,
+      operational_date: date,
+      room: entryBody.room,
+      shift,
+      text,
+      author_member_id: req.admin.id,
+      author_name: entryBody.authorName,
+      author_role: entryBody.authorRole,
+      created_at_device: entryBody.createdAt,
+      device_id: null,
+      resident_id: resident.id,
+      resident_name: resident.name,
+      checksum,
+      source: PANEL_SOURCE,
+    });
+    if (error) throw error;
+    await audit(
+      req.orgId,
+      'member',
+      req.admin.id,
+      'notes.added',
+      { entryId: entryBody.id, resident: resident.name, room: resident.room, date, shift, late: date !== days.today },
+      { ip: req.ip }
+    );
+    res.json({ entry: { ...entryBody, checksum, source: PANEL_SOURCE } });
+  })
+);
+
+app.post(
+  '/admin/notes/void',
+  need('notes.view'),
+  wrap(async (req, res) => {
+    const body = z.object({ entryId: z.string().min(3).max(300), reason: z.string().trim().min(1).max(500) }).safeParse(req.body);
+    if (!body.success) return bad(res, 'Please give a reason.');
+    const { entryId, reason } = body.data;
+    const { data: entry, error: e1 } = await supabase
+      .from('note_entries')
+      .select('id, author_member_id, resident_name, room, operational_date, shift')
+      .eq('org_id', req.orgId)
+      .eq('id', entryId)
+      .maybeSingle();
+    if (e1) throw e1;
+    if (!entry) return res.status(404).json({ error: 'Note not found' });
+    if (entry.author_member_id !== req.admin.id && !req.admin.permissions.includes('notes.void'))
+      return res.status(403).json({ error: 'You can only cross out your own notes.', code: 'FORBIDDEN' });
+    const already = await loadVoids(req.orgId, [entryId]);
+    if (already.length > 0) return res.status(409).json({ error: 'This note is already crossed out.', code: 'ALREADY_VOIDED' });
+    const voidBody = { id: `void|${entryId}`, entryId, voidedBy: req.admin.id, reason, createdAt: nowIso() };
+    const checksum = sha256(voidBody);
+    const { error } = await supabase.from('note_entry_voids').insert({
+      org_id: req.orgId,
+      id: voidBody.id,
+      entry_id: entryId,
+      voided_by: req.admin.id,
+      reason,
+      created_at_device: voidBody.createdAt,
+      device_id: null,
+      checksum,
+    });
+    if (error) throw error;
+    await audit(
+      req.orgId,
+      'member',
+      req.admin.id,
+      'notes.voided',
+      { entryId, reason, resident: entry.resident_name || null, room: entry.room, date: entry.operational_date, shift: entry.shift },
+      { ip: req.ip }
+    );
+    res.json({ ok: true });
+  })
+);
+
+// Printing makes a paper copy of residents' information: who printed what is recorded.
+app.post(
+  '/admin/notes/printed',
+  need('notes.view'),
+  wrap(async (req, res) => {
+    const body = z
+      .object({ date: isoDate, shift: shiftKey.optional(), area: z.string().max(80).optional() })
+      .safeParse(req.body);
+    if (!body.success) return bad(res);
+    await audit(req.orgId, 'member', req.admin.id, 'notes.printed', body.data, { ip: req.ip });
+    res.json({ ok: true });
   })
 );
 
@@ -2296,4 +2528,3 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Serwer działa na porcie ${PORT}`));
-
