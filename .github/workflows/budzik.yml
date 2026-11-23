@@ -1,0 +1,19 @@
+# Alarm clock ("budzik"): once a day it wakes the server and makes one tiny database read,
+# so the free Supabase project is never paused for being unused.
+# If it fails, GitHub sends an e-mail about a failed workflow - then check Supabase and Render.
+name: Wake server and database
+
+on:
+  schedule:
+    - cron: "17 5 * * *"   # every day, 05:17 UTC
+  workflow_dispatch:         # "Run workflow" button for a manual test
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wake the server (free Render sleeps)
+        run: curl -sS --max-time 120 --retry 6 --retry-delay 20 --retry-all-errors https://carehandover-backend.onrender.com/health
+      - name: Read the database once
+        run: curl -fsS --max-time 60 --retry 3 --retry-delay 20 --retry-all-errors https://carehandover-backend.onrender.com/health/db

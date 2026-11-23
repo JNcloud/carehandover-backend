@@ -644,6 +644,18 @@ async function isLastManager(orgId, memberId) {
 // No auth: wakes the free Render instance.
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// No auth: the "alarm clock". A tiny database read, so the free Supabase project counts as used
+// and does not pause after 7 days. Returns no data. At most one real read per minute.
+let lastDbCheck = { at: 0, ok: false };
+app.get('/health/db', async (req, res) => {
+  if (Date.now() - lastDbCheck.at > 60_000) {
+    const { error } = await supabase.from('organizations').select('id').limit(1);
+    lastDbCheck = { at: Date.now(), ok: !error };
+    if (error) console.error('[health/db] database check failed:', error.code || '', error.message);
+  }
+  res.status(lastDbCheck.ok ? 200 : 503).json({ ok: lastDbCheck.ok });
+});
+
 /* ================================================================== */
 /* Device pairing (needs internet, once per tablet)                    */
 /* ================================================================== */
