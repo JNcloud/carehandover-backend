@@ -1,4 +1,5 @@
-// ZNACZNIK_NOWEJ_WERSJI p6-export (2026-11-10): export notes (PDF / Excel), one resident or all, logged and announced
+// ZNACZNIK_NOWEJ_WERSJI p7-security (2026-11-23): the server checks resident ticks, warns on new devices, generous limits
+// p6-export (2026-11-10): export notes (PDF / Excel), one resident or all, logged and announced
 // p5-notes (2026-11-10): Notes in the administrator panel (read, report, print, write, cross out)
 // p4-roles (2026-11-05): roles edited in the panel (ticks), residents.away permission
 // p3-away (2026-11-03): temporary moves (usual room held) and Away / In hospital
@@ -184,7 +185,15 @@ app.use((req, res, next) => {
   res.set('X-Content-Type-Options', 'nosniff');
   next();
 });
-app.use(express.json({ limit: '25mb' }));
+// p7: a stranger cannot fill the server with huge requests. Everything gets a generous 2 MB, read
+// before anyone is checked; only a paired device, AFTER its token is checked, may send up to 25 MB
+// (residents' photos, many notes after days offline).
+const SMALL_BODY = express.json({ limit: '2mb' });
+const DEVICE_BODY = express.json({ limit: '25mb' });
+app.use((req, res, next) => (req.path.startsWith('/sync/') ? next() : SMALL_BODY(req, res, next)));
+app.use('/sync', (req, res, next) =>
+  requireDevice(req, res, (err) => (err ? next(err) : DEVICE_BODY(req, res, next)))
+);
 
 /* ================================================================== */
 /* Helpers                                                             */
@@ -352,7 +361,11 @@ const eventSchema = z.object({
   type: z.string().regex(/^[a-z_.]{3,60}$/),
   memberId: uuid.optional(),
   at: isoInstant,
-  detail: z.record(z.any()).optional(),
+  // p7: a generous cap, so one device cannot fill the activity log (a usual entry is ~200 characters)
+  detail: z
+    .record(z.any())
+    .refine((d) => JSON.stringify(d).length <= 10_000, 'detail too long')
+    .optional(),
 });
 
 // Validates items one by one. A single bad item must never block the others.
@@ -379,6 +392,7 @@ function bearerOf(req) {
 /* ---------- tablets: device token ---------- */
 
 async function requireDevice(req, res, next) {
+  if (req.deviceId) return next(); // already checked for this request (p7: before reading a large body)
   try {
     const token = bearerOf(req);
     if (!token.startsWith('dev_'))
@@ -689,6 +703,14 @@ app.post(
 
     const members = await loadMembers(consumed.org_id);
     await audit(consumed.org_id, 'device', device.id, 'device.paired', {}, { ip: req.ip, deviceId: device.id });
+    // p7: a new device is a new way into residents' notes: everyone with full access is told.
+    const pairedBy = members.find((m) => m.id === consumed.created_by)?.full_name || 'a manager';
+    const deviceName = body.data.deviceName || consumed.device_name || 'A new device';
+    notifyFullAccess(consumed.org_id, {
+      event: 'device.paired',
+      subject: 'a new device was connected',
+      sentence: `${deviceName} was connected to Handover with a code made by ${pairedBy}. If you did not expect this, disconnect it in the administrator panel (Devices).`,
+    });
     res.json({
       token,
       deviceId: device.id,
@@ -960,6 +982,64 @@ function statusFields(r) {
   };
 }
 
+// p7: what each incoming resident change is, and whether its author may make it.
+async function residentVerdicts(orgId, incoming, authors, knowsAway) {
+  const members = await loadMembers(orgId);
+  const memberById = new Map(members.map((m) => [m.id, m]));
+  const may = (memberId, perm) => {
+    const m = memberId && memberById.get(memberId);
+    return Boolean(m && m.active && !m.archived_at && m.role.permissions.includes(perm));
+  };
+  const { data: rows, error } = await supabase
+    .from('handover_residents')
+    .select('id, room, name, tags, photo, home_room, away_reason, away_note, away_since, away_until, removed_at')
+    .eq('org_id', orgId);
+  if (error) throw error;
+  const byId = new Map((rows || []).map((r) => [r.id, r]));
+  const activeInRoom = (room) => (rows || []).filter((r) => !r.removed_at && r.room.toLowerCase() === String(room).toLowerCase());
+  const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  const instant = (v) => (v ? new Date(v).toISOString() : null);
+  const result = new Map();
+  for (const r of incoming) {
+    const key = r.id || r.room;
+    const cur = r.id ? byId.get(r.id) : activeInRoom(r.room).length === 1 ? activeInRoom(r.room)[0] : null;
+    let need = null;
+    let kind = null;
+    let from;
+    if (!cur || cur.removed_at) {
+      need = 'residents.manage';
+      kind = 'added';
+    } else {
+      const status = knowsAway(r) ? statusColumns(r) : null;
+      const moved = cur.room !== r.room;
+      const details =
+        cur.name !== r.name || !same(cur.tags || [], r.tags) || (cur.photo || null) !== (r.photo ?? null) || (status && (cur.home_room || null) !== status.home_room);
+      const awayChanged =
+        status &&
+        ((cur.away_reason || null) !== status.away_reason ||
+          (cur.away_note || null) !== status.away_note ||
+          instant(cur.away_since) !== instant(status.away_since) ||
+          (cur.away_until ? String(cur.away_until).slice(0, 10) : null) !== status.away_until);
+      if (moved || details) {
+        need = 'residents.manage';
+        kind = moved ? 'moved' : 'updated';
+        if (moved) from = cur.room;
+      } else if (awayChanged) {
+        need = 'residents.away';
+        kind = status.away_reason ? (cur.away_reason ? 'updated' : 'away') : 'back';
+        if (kind === 'updated') need = 'residents.away';
+      }
+    }
+    if (!need) result.set(key, { ok: true, kind: null }); // nothing really changed (a copy being re-sent)
+    else if (!authors[key]) result.set(key, { ok: false, reason: 'NO_AUTHOR' });
+    else if (!may(authors[key], need)) result.set(key, { ok: false, reason: 'NOT_ALLOWED' });
+    else result.set(key, { ok: true, kind, from });
+  }
+  const nameOf = (key) => byId.get(key)?.name || activeInRoom(key)[0]?.name || null;
+  const roomOf = (key) => byId.get(key)?.room || key;
+  return { get: (key) => result.get(key), may, nameOf, roomOf };
+}
+
 // From p1-rooms each resident has their own id, so two people can share a room. Older apps send
 // only the room: their resident is matched to the one person in that room, as before.
 app.post(
@@ -967,13 +1047,36 @@ app.post(
   requireDevice,
   wrap(async (req, res) => {
     const residents = validateItems(residentSchema, req.body.residents);
-    const removedRooms = z.array(z.string().min(1).max(20)).max(500).safeParse(req.body.removedRooms ?? []);
-    const removedIds = z.array(uuid).max(500).safeParse(req.body.removedIds ?? []);
+    const removedRoomsIn = z.array(z.string().min(1).max(20)).max(500).safeParse(req.body.removedRooms ?? []);
+    const removedIdsIn = z.array(uuid).max(500).safeParse(req.body.removedIds ?? []);
     const stamp = () => ({ removed_at: null, updated_at: nowIso() }); // admitting (or editing) brings it back
     // Apps from p3 always send homeRoom and away (null when none). Older apps do not know them,
     // so their rows are saved without those columns and never clear a status set on another device.
     const knowsAway = (r) => r.homeRoom !== undefined || r.away !== undefined;
-    const withId = residents.valid.filter((r) => r.id);
+
+    // p7: the device says WHO made each change (key = resident id, or room for older records), and the
+    // server checks that person's ticks: "Add, change, move and remove residents" or "Mark away / back".
+    // A change nobody may make is not saved, and is written in the activity log.
+    const authorsIn = z.record(z.string().min(1).max(60), uuid).safeParse(req.body.changedBy ?? {});
+    const authors = authorsIn.success ? authorsIn.data : {};
+    const verdict = await residentVerdicts(req.orgId, residents.valid, authors, knowsAway);
+    const refused = [];
+    const refuse = (key, name, reason) => refused.push({ key, name, reason });
+    const allowedResidents = residents.valid.filter((r) => {
+      const v = verdict.get(r.id || r.room);
+      if (v.ok) return true;
+      refuse(r.id || r.room, r.name, v.reason);
+      return false;
+    });
+    const removalOk = (key) => {
+      const by = authors[key];
+      if (verdict.may(by, 'residents.manage')) return true;
+      refuse(key, verdict.nameOf(key), by ? 'NOT_ALLOWED' : 'NO_AUTHOR');
+      return false;
+    };
+    const removedIds = { success: removedIdsIn.success, data: removedIdsIn.success ? removedIdsIn.data.filter(removalOk) : [] };
+    const removedRooms = { success: removedRoomsIn.success, data: removedRoomsIn.success ? removedRoomsIn.data.filter(removalOk) : [] };
+    const withId = allowedResidents.filter((r) => r.id);
     for (const group of [withId.filter(knowsAway), withId.filter((r) => !knowsAway(r))]) {
       for (const part of chunks(group, 50)) {
         const rows = part.map((r) => ({
@@ -990,7 +1093,7 @@ app.post(
         if (error) throw error;
       }
     }
-    for (const r of residents.valid.filter((x) => !x.id)) {
+    for (const r of allowedResidents.filter((x) => !x.id)) {
       const { data: inRoom, error: readError } = await supabase
         .from('handover_residents')
         .select('id')
@@ -1026,7 +1129,17 @@ app.post(
       if (error) throw error;
       removed += removedRooms.data.length;
     }
-    res.json({ ok: true, stored: residents.valid.length, removed, rejected: residents.rejected });
+    // Who did what, in the activity log (only real changes, never a copy that changed nothing).
+    for (const r of allowedResidents) {
+      const v = verdict.get(r.id || r.room);
+      if (v.kind && authors[r.id || r.room])
+        await audit(req.orgId, 'member', authors[r.id || r.room], `resident.${v.kind}`, { name: r.name, room: r.room, ...(v.from ? { from: v.from } : {}), ...(r.away && v.kind === 'away' ? { reason: r.away.reason } : {}) }, { ip: req.ip, deviceId: req.deviceId });
+    }
+    for (const key of [...removedIds.data, ...removedRooms.data])
+      await audit(req.orgId, 'member', authors[key], 'resident.removed', { name: verdict.nameOf(key), room: verdict.roomOf(key) }, { ip: req.ip, deviceId: req.deviceId });
+    for (const x of refused)
+      await audit(req.orgId, authors[x.key] ? 'member' : 'device', authors[x.key] || req.deviceId || null, 'resident.refused', { name: x.name, reason: x.reason }, { ip: req.ip, deviceId: req.deviceId });
+    res.json({ ok: true, stored: allowedResidents.length, removed, rejected: residents.rejected, refused });
   })
 );
 
